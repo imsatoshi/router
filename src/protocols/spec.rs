@@ -551,6 +551,92 @@ pub struct ChatCompletionRequest {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ChatCompletionRequest {
+    /// Prefix-ordered routing text for cache-aware routing of chat requests
+    /// without a session id (lingjing patch).
+    ///
+    /// Chat templates render tool definitions ahead of the conversation, so
+    /// tools come first (in wire order), followed by every message in order.
+    /// A follow-up turn then extends the previous turn's text, which is what
+    /// the cache-aware radix tree needs to keep a conversation on the replica
+    /// that already holds its KV prefix.
+    pub fn chat_prefix_routing_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(tools) = &self.tools {
+            for tool in tools {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    tool.function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text));
+                    }
+                }
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("user:{}", text));
+                    }
+                }
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text));
+                        }
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            parts.push(format!(
+                                "assistant_tool_call:{}:{}",
+                                call.function.name,
+                                call.function.arguments.as_deref().unwrap_or("")
+                            ));
+                        }
+                    }
+                    if let Some(call) = function_call {
+                        parts.push(format!(
+                            "assistant_function_call:{}:{}",
+                            call.name,
+                            call.arguments.as_deref().unwrap_or("")
+                        ));
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        parts.push(format!("tool:{}", text));
+                    } else if let Some(items) = content.as_array() {
+                        for item in items {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                parts.push(format!("tool:{}", text));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } => {
+                    parts.push(format!("function:{}:{}", name, content));
+                }
+                // Model-specific roles (e.g. developer) still occupy prompt
+                // positions; keep them so later turns stay prefix-aligned.
+                ChatMessage::Other(value) => parts.push(format!("other:{}", value)),
+            }
+        }
+        parts.join("\n")
+    }
+}
+
 impl GenerationRequest for ChatCompletionRequest {
     fn is_stream(&self) -> bool {
         self.stream
@@ -561,13 +647,16 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        self.session_params
+        if let Some(session_id) = self
+            .session_params
             .as_ref()
             .and_then(|params| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+        {
+            return session_id.to_string();
+        }
+        self.chat_prefix_routing_text()
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {

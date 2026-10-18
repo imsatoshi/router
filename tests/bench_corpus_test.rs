@@ -125,7 +125,11 @@ fn builders_produce_typed_requests_with_expected_routing_text() {
     assert_ne!(key, prompt);
 
     let chat_req = to_chat_request(&chat(Some("system"), &prompt));
-    assert_eq!(chat_req.extract_text_for_routing(), "");
+    // lingjing patch: chat without a session id routes on its prefix-ordered messages.
+    assert_eq!(
+        chat_req.extract_text_for_routing(),
+        format!("system:system\nuser:{}", prompt)
+    );
     let session = to_chat_request(&chat_with_session("s-1", &prompt));
     assert_eq!(session.extract_text_for_routing(), "s-1");
 }
