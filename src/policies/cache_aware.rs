@@ -391,10 +391,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .position(|w| w.url() == tenant_url)
                 .filter(|&idx| workers[idx].is_healthy())
         } else {
-            // Low cache match: use worker with minimum load
+            // Low cache match: use worker with minimum load. lingjing patch: break
+            // load ties by the least text held in this worker's tree, so a lightly
+            // loaded fleet (every load == 0) spreads new conversations instead of
+            // always picking the first healthy worker.
             healthy_indices
                 .iter()
-                .min_by_key(|&&idx| workers[idx].load())
+                .min_by_key(|&&idx| {
+                    let held = tree
+                        .tenant_char_count
+                        .get(workers[idx].url())
+                        .map(|count| *count)
+                        .unwrap_or(0);
+                    (workers[idx].load(), held)
+                })
                 .copied()
         };
 
@@ -583,6 +593,32 @@ mod tests {
         // Both eligible workers have equal load, so the unhealthy zero-load
         // worker must not switch the policy into load-balancing mode.
         assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+    }
+
+    #[test]
+    fn idle_fleet_spreads_new_conversations_by_tree_size() {
+        // lingjing patch: with every worker at load 0, unrelated new conversations
+        // must not all land on the first worker; follow-up turns keep affinity.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = (1..=2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(format!("http://w{i}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+
+        let a = policy.select_worker(&workers, Some("system:alpha conversation one")).unwrap();
+        let b = policy.select_worker(&workers, Some("system:beta conversation two")).unwrap();
+        assert_ne!(a, b, "second unrelated conversation must go to the emptier worker");
+        let a2 = policy
+            .select_worker(&workers, Some("system:alpha conversation one\nuser:next turn"))
+            .unwrap();
+        assert_eq!(a, a2, "follow-up turn keeps its worker");
     }
 
     #[test]
