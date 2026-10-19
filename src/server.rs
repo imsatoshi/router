@@ -168,6 +168,10 @@ async fn readiness(State(state): State<Arc<AppState>>, req: Request) -> Response
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+    // lingjing patch: stay not-ready until the startup affinity snapshot is applied.
+    if !crate::lingjing_affinity::bootstrap_ready() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "lingjing affinity bootstrap pending").into_response();
+    }
 
     state.router.readiness()
 }
@@ -537,6 +541,14 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     state.router.flush_cache().await
 }
 
+/// lingjing patch: snapshot of remembered affinities for a peer router that just started.
+async fn lingjing_affinity_snapshot(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    Json(crate::lingjing_affinity::snapshot()).into_response()
+}
+
 /// lingjing patch: receive session→worker affinities from a peer router (see lingjing_affinity.rs).
 async fn lingjing_affinity(
     State(state): State<Arc<AppState>>,
@@ -870,7 +882,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
-        .route("/lingjing/affinity", post(lingjing_affinity))
+        .route("/lingjing/affinity", post(lingjing_affinity).get(lingjing_affinity_snapshot))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes

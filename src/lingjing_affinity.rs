@@ -8,6 +8,10 @@
 //! that moves to the surviving router then still lands on the replica that holds its
 //! KV cache. Long prefix texts are not sent (cost); they rely on gateway pinning.
 //!
+//! A router that starts (rollout, replacement) first pulls a snapshot of the peers'
+//! affinities and stays not-ready until it has applied it (or 60s passed), so the
+//! headless service never hands it sessions it knows nothing about.
+//!
 //! Enabled by LINGJING_ROUTER_PEERS=<headless host>; LINGJING_ROUTER_SELF_IP excludes
 //! this pod. Received entries are applied only for workers this router already knows
 //! and are never re-broadcast.
@@ -15,6 +19,8 @@
 use crate::tree::Tree;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -26,6 +32,9 @@ const QUEUE_CAPACITY: usize = 20_000;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PEER_REFRESH: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_secs(1);
+/// Affinities remembered for snapshots (most recent kept). Sessions are thousands, not millions.
+const JOURNAL_CAPACITY: usize = 100_000;
+const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Affinity {
@@ -38,6 +47,53 @@ type Trees = Arc<DashMap<String, Arc<Tree>>>;
 
 static TREES: OnceLock<Mutex<Vec<Trees>>> = OnceLock::new();
 static SENDER: OnceLock<SyncSender<Affinity>> = OnceLock::new();
+/// false only while a router with peers is pulling the startup snapshot.
+static BOOTSTRAPPED: AtomicBool = AtomicBool::new(true);
+
+#[derive(Default)]
+struct Journal {
+    latest: HashMap<(String, String), String>,
+    order: VecDeque<(String, String)>,
+}
+
+static JOURNAL: OnceLock<Mutex<Journal>> = OnceLock::new();
+
+fn record(model: &str, text: &str, url: &str) {
+    let mut j = JOURNAL
+        .get_or_init(|| Mutex::new(Journal::default()))
+        .lock()
+        .unwrap();
+    let key = (model.to_string(), text.to_string());
+    if j.latest.insert(key.clone(), url.to_string()).is_none() {
+        j.order.push_back(key);
+        while j.order.len() > JOURNAL_CAPACITY {
+            if let Some(old) = j.order.pop_front() {
+                j.latest.remove(&old);
+            }
+        }
+    }
+}
+
+/// Every remembered affinity, for a peer that just started.
+pub fn snapshot() -> Vec<Affinity> {
+    let Some(j) = JOURNAL.get() else {
+        return Vec::new();
+    };
+    let j = j.lock().unwrap();
+    j.latest
+        .iter()
+        .map(|((model, text), url)| Affinity {
+            model: model.clone(),
+            text: text.clone(),
+            url: url.clone(),
+        })
+        .collect()
+}
+
+/// Readiness gate: false while the startup snapshot is being pulled.
+pub fn bootstrap_ready() -> bool {
+    BOOTSTRAPPED.load(Ordering::Acquire)
+}
 
 /// Called by every CacheAwarePolicy so received affinities reach its trees.
 pub fn register_trees(trees: Trees) {
@@ -54,6 +110,7 @@ pub fn publish(model: &str, text: &str, url: &str) {
         return;
     }
     if let Some(tx) = SENDER.get() {
+        record(model, text, url);
         match tx.try_send(Affinity {
             model: model.to_string(),
             text: text.to_string(),
@@ -72,29 +129,45 @@ pub fn publish(model: &str, text: &str, url: &str) {
     }
 }
 
-/// Apply affinities received from a peer. Only workers already present in a tree are
-/// accepted (a peer may know a replica this router has not discovered yet, or one that
-/// left); entries are inserted directly and not re-published, so there is no echo.
+/// Apply affinities received from a peer (or a startup snapshot). The model's tree is
+/// created if this router has not routed that model yet (trees are created lazily on the
+/// first request, so a fresh router has none). The worker does not have to be known
+/// yet: if it is gone by the time a session returns, cache_aware drops the stale tenant
+/// and falls back to a healthy worker (existing behaviour). Entries are inserted
+/// directly and not re-published, so there is no echo.
 pub fn apply(items: &[Affinity]) -> usize {
     let Some(all) = TREES.get() else { return 0 };
     let all = all.lock().unwrap().clone();
+    let Some(first) = all.first() else { return 0 };
     let mut applied = 0;
+    let mut rejected = 0;
     for it in items {
-        if it.text.is_empty() || it.text.len() > MAX_SYNC_TEXT_BYTES {
+        if it.text.is_empty()
+            || it.text.len() > MAX_SYNC_TEXT_BYTES
+            || it.url.is_empty()
+            || it.model.is_empty()
+        {
+            rejected += 1;
             continue;
         }
+        let mut inserted = false;
         for trees in &all {
             if let Some(tree) = trees.get(&it.model) {
-                if tree.tenant_char_count.contains_key(it.url.as_str()) {
-                    tree.insert(&it.text, &it.url);
-                    applied += 1;
-                }
+                tree.insert(&it.text, &it.url);
+                inserted = true;
             }
         }
+        if !inserted {
+            first
+                .entry(it.model.clone())
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .insert(&it.text, &it.url);
+        }
+        record(&it.model, &it.text, &it.url);
+        applied += 1;
     }
     metrics::counter!("vllm_router_lingjing_affinity_total", "result" => "applied")
         .increment(applied as u64);
-    let rejected = items.len().saturating_sub(applied.min(items.len()));
     metrics::counter!("vllm_router_lingjing_affinity_total", "result" => "rejected")
         .increment(rejected as u64);
     applied
@@ -122,6 +195,8 @@ pub fn start_from_env() {
         "lingjing affinity sync: peers={} port={} self={}",
         peers_host, port, self_ip
     );
+    BOOTSTRAPPED.store(false, Ordering::Release);
+    tokio::spawn(bootstrap(peers_host.clone(), port, self_ip.clone()));
     tokio::spawn(run(peers_host, port, self_ip, rx));
 }
 
@@ -155,6 +230,49 @@ async fn resolve_peers(host: &str, port: u16, self_ip: &str) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Pull peers' snapshots; mark ready when done or at the deadline.
+async fn bootstrap(host: String, port: u16, self_ip: String) {
+    let start = Instant::now();
+    // Trees are registered when the policy is built at startup; give that a moment.
+    while TREES.get().is_none() && start.elapsed() < BOOTSTRAP_DEADLINE {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build();
+    let mut applied = 0;
+    if let Ok(client) = client {
+        for peer in resolve_peers(&host, port, &self_ip).await {
+            if start.elapsed() >= BOOTSTRAP_DEADLINE {
+                break;
+            }
+            match client
+                .get(format!("http://{}/lingjing/affinity", peer))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => match r.json::<Vec<Affinity>>().await {
+                    Ok(items) => applied += apply(&items),
+                    Err(e) => warn!("lingjing affinity bootstrap: decode from {}: {}", peer, e),
+                },
+                Ok(r) => warn!(
+                    "lingjing affinity bootstrap: {} answered {}",
+                    peer,
+                    r.status()
+                ),
+                Err(e) => warn!("lingjing affinity bootstrap: {}: {}", peer, e),
+            }
+        }
+    }
+    info!(
+        "lingjing affinity bootstrap done: applied={} after {:?}",
+        applied,
+        start.elapsed()
+    );
+    BOOTSTRAPPED.store(true, Ordering::Release);
 }
 
 async fn run(host: String, port: u16, self_ip: String, rx: Receiver<Affinity>) {
@@ -200,13 +318,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_only_known_workers_and_short_texts() {
+    fn apply_inserts_short_texts_and_creates_missing_trees() {
         let trees: Trees = Arc::new(DashMap::new());
         let tree = Arc::new(Tree::new());
         tree.insert("", "http://10.0.0.1:8000");
-        tree.insert("", "http://10.0.0.2:8000");
         trees.insert("m".to_string(), tree.clone());
-        register_trees(trees);
+        register_trees(trees.clone());
         let long = "x".repeat(MAX_SYNC_TEXT_BYTES + 1);
         let n = apply(&[
             Affinity {
@@ -214,13 +331,9 @@ mod tests {
                 text: "aaaaaaaaaaaaaaaa".into(),
                 url: "http://10.0.0.2:8000".into(),
             },
+            // fresh router: no tree for this model yet -> created
             Affinity {
-                model: "m".into(),
-                text: "bbbbbbbbbbbbbbbb".into(),
-                url: "http://10.9.9.9:8000".into(),
-            },
-            Affinity {
-                model: "other".into(),
+                model: "fresh".into(),
                 text: "cccccccccccccccc".into(),
                 url: "http://10.0.0.1:8000".into(),
             },
@@ -229,17 +342,34 @@ mod tests {
                 text: long.clone(),
                 url: "http://10.0.0.1:8000".into(),
             },
+            Affinity {
+                model: "m".into(),
+                text: "".into(),
+                url: "http://10.0.0.1:8000".into(),
+            },
         ]);
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
         let r = tree.prefix_match_with_counts("aaaaaaaaaaaaaaaa");
         assert_eq!(&*r.tenant, "http://10.0.0.2:8000");
         assert_eq!(r.matched_char_count, 16);
-        assert_eq!(
-            tree.prefix_match_with_counts("bbbbbbbbbbbbbbbb")
-                .matched_char_count,
-            0
-        );
         assert_eq!(tree.prefix_match_with_counts(&long).matched_char_count, 0);
+        let fresh = trees.get("fresh").expect("tree created for unseen model");
+        assert_eq!(
+            &*fresh.prefix_match_with_counts("cccccccccccccccc").tenant,
+            "http://10.0.0.1:8000"
+        );
+    }
+
+    #[test]
+    fn journal_snapshot_keeps_latest_per_session() {
+        record("m2", "s1", "http://a:8000");
+        record("m2", "s1", "http://b:8000");
+        record("m2", "s2", "http://a:8000");
+        let mut snap: Vec<_> = snapshot().into_iter().filter(|a| a.model == "m2").collect();
+        snap.sort_by(|x, y| x.text.cmp(&y.text));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].url, "http://b:8000");
+        assert_eq!(snap[1].text, "s2");
     }
 
     #[test]
