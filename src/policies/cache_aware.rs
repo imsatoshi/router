@@ -130,6 +130,9 @@ impl CacheAwarePolicy {
             None
         };
 
+        // lingjing patch: let peer routers' affinities reach these trees.
+        crate::lingjing_affinity::register_trees(Arc::clone(&trees));
+
         Self {
             config,
             trees,
@@ -276,6 +279,7 @@ impl CacheAwarePolicy {
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
                 tree.insert(text, worker_url);
+                crate::lingjing_affinity::publish(model_id, text, worker_url);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -411,6 +415,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if let Some(idx) = selected_idx {
             // Update the tree with this request (use worker URL directly, no allocation)
             tree.insert(text, workers[idx].url());
+            crate::lingjing_affinity::publish(model_id, text, workers[idx].url());
 
             // Increment processed counter
             workers[idx].increment_processed();

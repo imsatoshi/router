@@ -537,6 +537,19 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     state.router.flush_cache().await
 }
 
+/// lingjing patch: receive session→worker affinities from a peer router (see lingjing_affinity.rs).
+async fn lingjing_affinity(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(items): Json<Vec<crate::lingjing_affinity::Affinity>>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    let applied = crate::lingjing_affinity::apply(&items);
+    Json(serde_json::json!({ "applied": applied })).into_response()
+}
+
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -857,6 +870,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/lingjing/affinity", post(lingjing_affinity))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
@@ -1207,6 +1221,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 async fn bind_listener(
     addr: &str,
 ) -> std::io::Result<impl Listener<Io = TcpStream, Addr = SocketAddr>> {
+    crate::lingjing_affinity::start_from_env();
     let listener = TcpListener::bind(addr).await?;
     Ok(listener.tap_io(|tcp| {
         if let Err(err) = tcp.set_nodelay(true) {
