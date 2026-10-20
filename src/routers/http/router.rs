@@ -1582,7 +1582,11 @@ impl Router {
                 loop {
                     let chunk = tokio::select! {
                         biased;
-                        _ = tx.closed() => break,
+                        _ = tx.closed() => {
+                            // Client went away mid-stream: same outcome as a failed tx.send below.
+                            stream_succeeded = false;
+                            break;
+                        }
                         chunk = stream.next() => chunk,
                     };
                     let Some(chunk) = chunk else { break };
@@ -1668,7 +1672,11 @@ impl Router {
                 loop {
                     let chunk = tokio::select! {
                         biased;
-                        _ = tx.closed() => break,
+                        _ = tx.closed() => {
+                            // Client went away mid-stream: same outcome as a failed tx.send below.
+                            stream_succeeded = false;
+                            break;
+                        }
                         chunk = stream.next() => chunk,
                     };
                     let Some(chunk) = chunk else { break };
