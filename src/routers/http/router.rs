@@ -1545,9 +1545,11 @@ impl Router {
             }
 
             response
-        } else if let Some(mut load) = load {
+        } else if let Some(mut load) = load.filter(|_| status.is_success()) {
             // Streaming with load tracking: the forwarder owns the reservation and releases it
             // at [DONE], or on exit (end of stream, upstream error, client gone, task dropped).
+            // A non-2xx stream is an error body the caller may retry elsewhere: `filter` drops
+            // (releases) its reservation here, so the retry never sees this worker one too busy.
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -3748,5 +3750,128 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.ends_with(b"data: [DONE]\n\n"));
         assert_eq!(settled_load(&worker, 0).await, 0);
+    }
+
+    // ── 0005: gaps in 0004's coverage, non-2xx streams, drift reset guard ──
+
+    /// Serve one connection: write `head` then keep the socket open (no body end).
+    async fn serve_and_hold(head: &'static [u8]) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            if read_http_request(&mut socket).await.is_none() { return; }
+            let _ = socket.write_all(head).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn test_stream_load_released_at_done_while_upstream_stays_open() {
+        use http_body_util::BodyExt;
+        // [DONE] arrives but the upstream never ends the chunked body.
+        let url = serve_and_hold(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata: {}\r\ne\r\ndata: [DONE]\n\n\r\n").await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        let mut response = router.route_typed_request(None, &gen_req(true), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut seen = Vec::new();
+        while !seen.windows(12).any(|w| w == b"data: [DONE]") {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), response.body_mut().frame())
+                .await.expect("[DONE] frame").unwrap().unwrap();
+            seen.extend_from_slice(frame.into_data().unwrap().as_ref());
+        }
+        // Body still open (upstream holds the socket), but the request is done generating.
+        assert_eq!(settled_load(&worker, 0).await, 0, "[DONE] must release the load");
+        drop(response);
+    }
+
+    /// Backend that answers 503 and records the worker's load at the moment each attempt arrives.
+    async fn serve_503_probe(slot: Arc<std::sync::OnceLock<Arc<dyn Worker>>>, seen: Arc<std::sync::Mutex<Vec<usize>>>) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let (slot, seen) = (slot.clone(), seen.clone());
+                tokio::spawn(async move {
+                    if read_http_request(&mut socket).await.is_none() { return; }
+                    seen.lock().unwrap().push(slot.get().map(|w| w.load()).unwrap_or(usize::MAX));
+                    let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        url
+    }
+
+    async fn every_retry_attempt_holds_a_load(stream: bool) {
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = serve_503_probe(slot.clone(), seen.clone()).await;
+        let (router, worker) = cache_aware_router_with(&url, 3);
+        let _ = slot.set(worker.clone());
+        worker.increment_load(); // another request in flight on this worker
+        drop(router.route_typed_request(None, &gen_req(stream), "/generate", None).await);
+        let loads = seen.lock().unwrap().clone();
+        assert!(loads.len() >= 2, "expected retries, got {loads:?}");
+        // Sentinel 1 + exactly this attempt's own reservation; the previous attempt is already released.
+        assert!(loads.iter().all(|&l| l == 2), "each attempt must hold exactly one load: {loads:?}");
+        assert_eq!(settled_load(&worker, 1).await, 1);
+    }
+    #[tokio::test]
+    async fn test_every_retry_attempt_holds_a_load_nonstream() { every_retry_attempt_holds_a_load(false).await; }
+    #[tokio::test]
+    async fn test_every_retry_attempt_holds_a_load_stream() { every_retry_attempt_holds_a_load(true).await; }
+
+    #[tokio::test]
+    async fn test_stream_non_2xx_releases_load_before_returning() {
+        // A 503 whose error body never ends: the reservation must not ride along with it.
+        let url = serve_and_hold(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        worker.increment_load(); // another request in flight on this worker
+        let response = router.send_typed_request(
+            &serde_json::json!({"text": "error stream", "stream": true}),
+            TypedDispatch { headers: None, route: "/generate", worker_url: &url, is_stream: true, load: Some(LoadReservation::acquire(worker.clone())), prepared: None },
+            None,
+        ).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker.load(), 1, "non-2xx stream must release its load synchronously");
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn test_into_worker_hands_over_without_releasing() {
+        use http_body_util::BodyExt;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new("http://handover:1".to_string(), WorkerType::Regular));
+        let reservation = LoadReservation::acquire(worker.clone());
+        let held = reservation.into_worker().expect("worker handed over");
+        assert_eq!(worker.load(), 1, "handing over must neither release nor duplicate the load");
+        let response = hold_load_until_body_done(Response::new(Body::from("done")), held);
+        assert_eq!(worker.load(), 1, "body still owns the load");
+        let _ = response.into_body().collect().await.unwrap();
+        assert_eq!(worker.load(), 0, "body completion releases it exactly once");
+    }
+
+    #[test]
+    fn test_drift_reset_spares_busy_workers() {
+        use crate::core::worker_registry::reset_drifted_loads;
+        let a: Arc<dyn Worker> = Arc::new(BasicWorker::new("http://reset-a:1".to_string(), WorkerType::Regular));
+        let b: Arc<dyn Worker> = Arc::new(BasicWorker::new("http://reset-b:1".to_string(), WorkerType::Regular));
+        // A long generation spanning the reset cycle: a busy fleet keeps its real counts.
+        let long_runs: Vec<_> = (0..3).map(|_| LoadReservation::acquire(a.clone())).collect();
+        let other = LoadReservation::acquire(b.clone());
+        assert!(!reset_drifted_loads(&[a.clone(), b.clone()]), "must not reset while a worker is busy");
+        assert_eq!((a.load(), b.load()), (3, 1));
+        drop(long_runs);
+        assert_eq!(a.load(), 0, "finished generations release their own counts only");
+        assert_eq!(b.load(), 1, "the other worker's in-flight count is untouched");
+        drop(other);
+        // Near-idle fleet with leaked counts from unguarded paths: reset clears the drift.
+        b.increment_load();
+        b.increment_load();
+        assert!(reset_drifted_loads(&[a.clone(), b.clone()]));
+        assert_eq!((a.load(), b.load()), (0, 0));
     }
 }

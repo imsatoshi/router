@@ -423,19 +423,39 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Reset loads periodically
+                // Reset loads periodically, only when they look like drift
                 check_count += 1;
                 if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
-                    }
+                    reset_drifted_loads(&workers);
                 }
             }
         });
 
         crate::core::HealthChecker::new(handle, shutdown)
     }
+}
+
+/// Periodic drift reset for the registry health checker.
+///
+/// Regular HTTP load is reservation-tracked (released exactly once on every
+/// path), so an unconditional reset would erase the counts of requests still in
+/// flight — a generation spanning the reset would later release against a
+/// newer request's count and make a busy worker look idle. Paths that still
+/// pair increments by hand (transparent proxy, PD) can drift, so keep the reset
+/// but, like the legacy checker in worker.rs, only when every worker is nearly
+/// idle. Returns whether the reset happened.
+pub(crate) fn reset_drifted_loads(workers: &[Arc<dyn crate::core::Worker>]) -> bool {
+    let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
+    if max_load > 2 {
+        tracing::debug!("Skipping load reset, workers busy (max_load: {})", max_load);
+        return false;
+    }
+    tracing::debug!("Resetting worker loads (max_load: {})", max_load);
+    for worker in workers {
+        worker.reset_load();
+        crate::metrics::RouterMetrics::set_running_requests(worker.url(), 0);
+    }
+    true
 }
 
 impl Default for WorkerRegistry {
