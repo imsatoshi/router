@@ -96,6 +96,8 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
     eviction_handle: Option<thread::JoinHandle<()>>,
+    /// lingjing 0006: saturation state; None = the process-wide sampler (if started).
+    lingjing_load: Option<Arc<crate::lingjing_load::LoadState>>,
 }
 
 impl CacheAwarePolicy {
@@ -137,7 +139,38 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+            lingjing_load: None,
         }
+    }
+
+    /// lingjing 0006: use this saturation state instead of the process-wide one (tests).
+    pub fn with_lingjing_load(mut self, load: Arc<crate::lingjing_load::LoadState>) -> Self {
+        self.lingjing_load = Some(load);
+        self
+    }
+
+    fn lingjing_load(&self) -> Option<&crate::lingjing_load::LoadState> {
+        self.lingjing_load
+            .as_deref()
+            .or_else(|| crate::lingjing_load::state().map(|s| &**s))
+    }
+
+    /// lingjing 0006: the `key`-minimal healthy worker, steered off a saturated replica for
+    /// new sessions (see lingjing_load::place_new_session).
+    fn pick_new_session<K: Ord>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        key: impl Fn(usize) -> K,
+    ) -> Option<usize> {
+        let mut ranked = healthy_indices.to_vec();
+        ranked.sort_by_key(|&idx| key(idx));
+        crate::lingjing_load::place_new_session(
+            self.lingjing_load(),
+            workers,
+            &ranked,
+            self.config.balance_abs_threshold,
+        )
     }
 
     /// Select by the product of text-prefix affinity and current KV headroom.
@@ -267,7 +300,7 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced (lingjing 0006: never onto a saturated replica
         // while an unsaturated one exists)
         let min_load_idx =
-            pick_avoiding_saturated(workers, healthy_indices, |idx| workers[idx].load())?;
+            self.pick_new_session(workers, healthy_indices, |idx| workers[idx].load())?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -293,31 +326,6 @@ impl CacheAwarePolicy {
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
-    }
-}
-
-/// lingjing patch (0006): the `key`-minimal healthy worker, unless it is saturated
-/// (lingjing_load, opt-in) and an unsaturated one exists — then the best unsaturated one.
-fn pick_avoiding_saturated<K: Ord>(
-    workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
-    key: impl Fn(usize) -> K,
-) -> Option<usize> {
-    let best = healthy_indices.iter().copied().min_by_key(|&idx| key(idx))?;
-    if !crate::lingjing_load::avoid(workers[best].url()) {
-        return Some(best);
-    }
-    match healthy_indices
-        .iter()
-        .copied()
-        .filter(|&idx| !crate::lingjing_load::avoid(workers[idx].url()))
-        .min_by_key(|&idx| key(idx))
-    {
-        Some(idx) => {
-            crate::lingjing_load::record_avoided();
-            Some(idx)
-        }
-        None => Some(best),
     }
 }
 
@@ -425,7 +433,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // always picking the first healthy worker.
             // lingjing 0006: a new conversation is not placed on a saturated replica while an
             // unsaturated one exists; the cache-hit branch above keeps its affinity regardless.
-            pick_avoiding_saturated(workers, &healthy_indices, |idx| {
+            self.pick_new_session(workers, &healthy_indices, |idx| {
                 let held = tree
                     .tenant_char_count
                     .get(workers[idx].url())
@@ -623,64 +631,120 @@ mod tests {
         assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
     }
 
-    fn lingjing_fleet(tag: &str) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    fn lingjing_fleet(avoid: bool) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, Arc<crate::lingjing_load::LoadState>) {
+        let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            avoid_saturated: avoid,
+            ..Default::default()
+        }));
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
-        });
-        // Unique URLs: the saturation state is process-wide.
+        })
+        .with_lingjing_load(load.clone());
         let workers: Vec<Arc<dyn Worker>> = (0..3)
             .map(|index| {
-                Arc::new(BasicWorker::new(
-                    format!("http://lj0006-{tag}-{index}:8000"),
-                    WorkerType::Regular,
-                )) as Arc<dyn Worker>
+                Arc::new(BasicWorker::new(format!("http://lj0006-{index}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
             })
             .collect();
         policy.init_workers(&workers);
-        (policy, workers)
+        // Worker 0 carries one request, so the ordinary choice for a new session is worker 1
+        // (never the index-0 fallback, which would hide "fell through" behind "chose 0").
+        workers[0].increment_load();
+        (policy, workers, load)
     }
 
     #[test]
     fn new_sessions_avoid_saturated_replicas() {
-        // lingjing 0006: worker 0 would win every tie (load 0, empty tree); saturate it.
-        let (policy, workers) = lingjing_fleet("avoid");
-        let load = crate::lingjing_load::test_global();
-        load.force(workers[0].url(), true);
-        for turn in 0..6 {
-            let picked = policy.select_worker(&workers, Some(&format!("new conversation {turn}")));
-            assert_ne!(picked, Some(0), "turn {turn} landed on the saturated replica");
-        }
-        // Imbalanced (min-load) path: worker 0 is the least loaded but saturated.
+        let (policy, workers, load) = lingjing_fleet(true);
+        assert_eq!(policy.select_worker(&workers, Some("baseline newcomer")), Some(1));
+        load.force(workers[1].url(), true);
+        assert_eq!(policy.select_worker(&workers, Some("second newcomer")), Some(2));
+        // Imbalanced (min-load) path: loads 41 / 0 / 10 (abs threshold 32). Worker 1 is the
+        // least loaded but saturated; worker 2 is within the burst guard, so it takes the session.
         for _ in 0..40 {
-            workers[1].increment_load();
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
             workers[2].increment_load();
         }
-        workers[2].increment_load();
-        assert_eq!(policy.select_worker(&workers, Some("imbalanced newcomer")), Some(1));
+        assert_eq!(policy.select_worker(&workers, Some("imbalanced newcomer")), Some(2));
+    }
+
+    #[test]
+    fn avoidance_off_never_redirects() {
+        let (policy, workers, load) = lingjing_fleet(false);
+        load.force(workers[1].url(), true);
+        for turn in 0..4 {
+            assert_eq!(
+                policy.select_worker(&workers, Some(&format!("shadow newcomer {turn}"))),
+                Some(1),
+                "with avoidance off the saturated ordinary choice must stand"
+            );
+            workers[1].decrement_load();
+        }
     }
 
     #[test]
     fn cache_hit_keeps_affinity_on_saturated_replica() {
-        let (policy, workers) = lingjing_fleet("hit");
-        let picked = policy.select_worker(&workers, Some("long running session prefix")).unwrap();
-        crate::lingjing_load::test_global().force(workers[picked].url(), true);
+        let (policy, workers, load) = lingjing_fleet(true);
+        let first = policy.select_worker(&workers, Some("long running session prefix"));
+        assert_eq!(first, Some(1));
+        load.force(workers[1].url(), true);
         assert_eq!(
             policy.select_worker(&workers, Some("long running session prefix, next turn")),
-            Some(picked),
+            Some(1),
             "an existing session must not be migrated off its KV"
         );
     }
 
     #[test]
     fn nothing_is_avoided_when_every_replica_is_saturated() {
-        let (policy, workers) = lingjing_fleet("all");
-        let load = crate::lingjing_load::test_global();
+        let (policy, workers, load) = lingjing_fleet(true);
         for worker in &workers {
             load.force(worker.url(), true);
         }
-        // Falls back to the ordinary choice (worker 0 wins the idle tie).
-        assert_eq!(policy.select_worker(&workers, Some("everyone is busy")), Some(0));
+        // The ordinary choice (worker 1), not the index-0 fallback.
+        assert_eq!(policy.select_worker(&workers, Some("everyone is busy")), Some(1));
+    }
+
+    #[test]
+    fn redirect_is_refused_when_the_alternative_is_near_overload() {
+        // max_num_seqs guard
+        let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            avoid_saturated: true,
+            max_num_seqs: 4,
+            ..Default::default()
+        }));
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|index| {
+                Arc::new(BasicWorker::new(format!("http://lj0006-guard-{index}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        load.force(workers[0].url(), true);
+        for _ in 0..4 {
+            workers[1].increment_load();
+        }
+        assert_eq!(
+            crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 8),
+            Some(0),
+            "alternative at max_num_seqs must not take the session"
+        );
+        workers[1].decrement_load();
+        assert_eq!(crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 8), Some(1));
+        // abs-threshold guard: alternative already >= best + abs
+        let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            avoid_saturated: true,
+            ..Default::default()
+        }));
+        load.force(workers[0].url(), true);
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+        // workers[1].load() == 8, workers[0].load() == 0
+        assert_eq!(crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 8), Some(0));
+        assert_eq!(crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 9), Some(1));
     }
 
     #[test]

@@ -65,7 +65,12 @@ impl Default for Config {
 impl Config {
     pub fn from_env() -> Self {
         fn var<T: std::str::FromStr>(name: &str) -> Option<T> {
-            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+            let raw = std::env::var(name).ok()?;
+            let parsed = raw.trim().parse().ok();
+            if parsed.is_none() {
+                warn!(name, value = %raw, "lingjing load: unparsable env var, using the default");
+            }
+            parsed
         }
         let d = Config::default();
         Config {
@@ -73,12 +78,17 @@ impl Config {
             sat_kv: var("LINGJING_SAT_KV").unwrap_or(d.sat_kv),
             sat_waiting: var("LINGJING_SAT_WAITING").unwrap_or(d.sat_waiting),
             max_num_seqs: var("LINGJING_MAX_NUM_SEQS").unwrap_or(d.max_num_seqs),
-            avoid_saturated: matches!(
-                std::env::var("LINGJING_LOAD_AVOID_SATURATED")
-                    .as_deref()
-                    .map(str::trim),
-                Ok("1") | Ok("true")
-            ),
+            avoid_saturated: match std::env::var("LINGJING_LOAD_AVOID_SATURATED")
+                .as_deref()
+                .map(str::trim)
+            {
+                Ok("1") | Ok("true") => true,
+                Ok("") | Ok("0") | Ok("false") | Err(_) => false,
+                Ok(other) => {
+                    warn!(value = other, "lingjing load: LINGJING_LOAD_AVOID_SATURATED not 0/1/true/false, keeping avoidance off");
+                    false
+                }
+            },
         }
     }
 
@@ -153,6 +163,8 @@ impl Replica {
 #[derive(Debug)]
 pub struct LoadState {
     cfg: Config,
+    /// Any replica currently saturated? Lets the selection hot path skip the lock.
+    any_saturated: AtomicBool,
     replicas: Mutex<HashMap<String, Replica>>,
     sampled_at_ms: Mutex<u64>,
 }
@@ -161,6 +173,7 @@ impl LoadState {
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,
+            any_saturated: AtomicBool::new(false),
             replicas: Mutex::new(HashMap::new()),
             sampled_at_ms: Mutex::new(0),
         }
@@ -204,7 +217,14 @@ impl LoadState {
             .collect();
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
         // Follow the registry: forget workers it no longer holds.
-        replicas.retain(|url, _| workers.iter().any(|w| w.url() == url));
+        replicas.retain(|url, _| {
+            let kept = workers.iter().any(|w| w.url() == url);
+            if !kept {
+                metrics::gauge!("vllm_router_lingjing_replica_saturated", "worker" => url.clone())
+                    .set(0.0);
+            }
+            kept
+        });
         for worker in &workers {
             let entry = replicas.entry(worker.url().to_string()).or_default();
             if let Some(obs) = by_id.get(worker.url()) {
@@ -224,6 +244,8 @@ impl LoadState {
             metrics::gauge!("vllm_router_lingjing_replica_saturated", "worker" => worker.url().to_string())
                 .set(if entry.saturated { 1.0 } else { 0.0 });
         }
+        self.any_saturated
+            .store(replicas.values().any(|r| r.saturated), Ordering::Relaxed);
         drop(replicas);
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -235,8 +257,16 @@ impl LoadState {
             .set(wall as f64 / 1000.0);
     }
 
+    /// Cheap pre-check for the selection hot path (no lock).
+    pub fn any_saturated(&self) -> bool {
+        self.any_saturated.load(Ordering::Relaxed)
+    }
+
     /// True when new sessions should avoid this worker.
     pub fn is_saturated(&self, url: &str) -> bool {
+        if !self.any_saturated() {
+            return false;
+        }
         self.replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -330,15 +360,46 @@ pub fn state() -> Option<&'static Arc<LoadState>> {
     STATE.get()
 }
 
-/// Steer new sessions away from `url`? Only with LINGJING_LOAD_AVOID_SATURATED.
-pub fn avoid(url: &str) -> bool {
-    STATE
-        .get()
-        .is_some_and(|s| s.cfg.avoid_saturated && s.is_saturated(url))
-}
-
-pub fn record_avoided() {
+/// Placement of a new session: the policy's `best` choice, or an unsaturated `alternative`.
+///
+/// `candidates` are healthy worker indices in the policy's preference order (best first).
+/// Redirect only when `best` is saturated, an unsaturated candidate exists, and that candidate
+/// is not itself near overload: `load() >= max_num_seqs` or `load() >= best's + abs_threshold`
+/// (so a burst does not pile onto the one replica left). With avoidance off the decision is
+/// still computed and counted as "would avoid", but `best` is returned.
+pub fn place_new_session(
+    state: Option<&LoadState>,
+    workers: &[Arc<dyn Worker>],
+    candidates: &[usize],
+    abs_threshold: usize,
+) -> Option<usize> {
+    let best = *candidates.first()?;
+    let Some(state) = state else {
+        return Some(best);
+    };
+    if !state.any_saturated() || !state.is_saturated(workers[best].url()) {
+        return Some(best);
+    }
+    // Every replica saturated: nothing to steer to, keep the ordinary choice.
+    let Some(alt) = candidates
+        .iter()
+        .copied()
+        .find(|&idx| !state.is_saturated(workers[idx].url()))
+    else {
+        return Some(best);
+    };
+    let (alt_load, best_load) = (workers[alt].load(), workers[best].load());
+    let max = state.cfg.max_num_seqs;
+    if (max > 0 && alt_load >= max) || alt_load >= best_load + abs_threshold.max(1) {
+        return Some(best);
+    }
+    if !state.cfg.avoid_saturated {
+        metrics::counter!("vllm_router_lingjing_new_session_would_avoid_saturated_total")
+            .increment(1);
+        return Some(best);
+    }
     metrics::counter!("vllm_router_lingjing_new_session_avoided_saturated_total").increment(1);
+    Some(alt)
 }
 
 /// Start the sampler from the environment (idempotent).
@@ -368,21 +429,13 @@ pub fn start_from_env(
 }
 
 #[cfg(test)]
-pub(crate) fn test_global() -> &'static Arc<LoadState> {
-    STATE.get_or_init(|| {
-        Arc::new(LoadState::new(Config {
-            avoid_saturated: true,
-            ..Config::default()
-        }))
-    })
-}
-
-#[cfg(test)]
 impl LoadState {
     /// Pin a replica's hysteresis verdict (cache_aware tests).
     pub(crate) fn force(&self, url: &str, saturated: bool) {
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
         replicas.entry(url.to_string()).or_default().saturated = saturated;
+        self.any_saturated
+            .store(replicas.values().any(|r| r.saturated), Ordering::Relaxed);
     }
 }
 
@@ -570,6 +623,15 @@ mod tests {
         assert!(replica(&s, &b.url)["age_ms"].is_null());
         assert_eq!(s["fresh"], 0);
         assert_eq!(s["running_sum"], 0, "stale samples are not summed");
+        // Stale-but-saturated still counts toward saturated (fail-closed).
+        assert_eq!(s["saturated"], 1);
+        assert_eq!(s["all_saturated"], false);
+        let only_a = registry_with(&[&a.url]);
+        assert_eq!(
+            state.summary(&only_a)["all_saturated"],
+            true,
+            "a stale saturated replica keeps the instance saturated"
+        );
     }
 
     #[tokio::test]
@@ -599,6 +661,28 @@ mod tests {
             "removed worker must be forgotten"
         );
         assert!(a.hits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn router_inflight_feeds_the_sampled_verdict() {
+        let a = FakeEngine::start().await;
+        a.set(0, 0, 0.1); // the engine looks idle
+        let registry = registry_with(&[&a.url]);
+        let worker = registry.get_by_url(&a.url).unwrap();
+        worker.increment_load();
+        worker.increment_load();
+        let state = LoadState::new(Config {
+            max_num_seqs: 2,
+            ..Config::default()
+        });
+        state.sample(&registry, &provider()).await;
+        let s = state.summary(&registry);
+        assert_eq!(
+            replica(&s, &a.url)["saturated_now"],
+            true,
+            "router in-flight >= max_num_seqs"
+        );
+        assert_eq!(replica(&s, &a.url)["router_inflight"], 2);
     }
 
     #[test]
