@@ -1579,7 +1579,13 @@ impl Router {
                 let mut decremented = false;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        _ = tx.closed() => break,
+                        chunk = stream.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break };
                     match chunk {
                         Ok(bytes) => {
                             if first_sse {
@@ -1659,7 +1665,13 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        _ = tx.closed() => break,
+                        chunk = stream.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break };
                     match chunk {
                         Ok(bytes) => {
                             if first_sse {
@@ -3523,4 +3535,65 @@ mod tests {
 
         health_checker.shutdown().await;
     }
+
+    async fn stalled_stream_disconnect(tracked: bool, between_chunks: bool) {
+        use http_body_util::BodyExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8(request).unwrap();
+            assert!(headers.starts_with("POST /generate "));
+            let length: usize = headers.lines().find_map(|line| {
+                line.to_ascii_lowercase().strip_prefix("content-length: ")
+                    .map(|v| v.trim().parse().unwrap())
+            }).unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            if between_chunks {
+                socket.write_all(b"3\r\none\r\n").await.unwrap();
+            }
+            // No next output: cancellation must not require another chunk.
+            let n = socket.read(&mut byte).await.unwrap();
+            let _ = stopped_tx.send(n);
+        });
+        let router = create_test_regular_router();
+        let worker = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
+        router.worker_registry.register(worker.clone());
+        if tracked { worker.increment_load(); }
+        let mut response = router.send_typed_request(
+            &serde_json::json!({"text":"owned test", "stream":true}),
+            TypedDispatch { headers: None, route: "/generate", worker_url: &url, is_stream: true, load_incremented: tracked, prepared: None },
+            None,
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        if between_chunks {
+            let frame = timeout(Duration::from_secs(1), response.body_mut().frame()).await.unwrap().unwrap().unwrap();
+            assert_eq!(frame.into_data().unwrap().as_ref(), b"one");
+        }
+        drop(response);
+        let stopped = timeout(Duration::from_millis(500), stopped_rx).await;
+        backend.abort();
+        let _ = backend.await;
+        assert_eq!(stopped.expect("stalled upstream must close when client body is dropped").unwrap(), 0);
+        assert_eq!(worker.load(), 0, "tracked load must be released exactly once");
+    }
+    #[tokio::test]
+    async fn test_stalled_stream_disconnect_before_tracked() { stalled_stream_disconnect(true, false).await; }
+    #[tokio::test]
+    async fn test_stalled_stream_disconnect_between_tracked() { stalled_stream_disconnect(true, true).await; }
+    #[tokio::test]
+    async fn test_stalled_stream_disconnect_before_untracked() { stalled_stream_disconnect(false, false).await; }
+    #[tokio::test]
+    async fn test_stalled_stream_disconnect_between_untracked() { stalled_stream_disconnect(false, true).await; }
 }
