@@ -68,6 +68,43 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
+/// One cache-aware load reservation on a worker: `acquire` increments, and the reservation
+/// decrements exactly once, either through `release` or when it is dropped. It is moved
+/// along with the request (route_typed_request -> send_typed_request -> body / forwarder),
+/// so a client that disconnects at any await point (handler future dropped), an error path,
+/// a retry or a panic all release it, and no path can release it twice.
+struct LoadReservation {
+    worker: Option<Arc<dyn Worker>>,
+}
+
+impl LoadReservation {
+    fn acquire(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self {
+            worker: Some(worker),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+
+    /// Hand the reservation to a response body (hold_load_until_body_done takes over the decrement).
+    fn into_worker(mut self) -> Option<Arc<dyn Worker>> {
+        self.worker.take()
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct LoadTrackedBody {
     inner: Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
@@ -137,7 +174,7 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    load_incremented: bool,
+    load: Option<LoadReservation>,
     prepared: Option<crate::backend::PreparedChat>,
 }
 
@@ -1142,18 +1179,10 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
+                // The reservation travels with the request and releases itself however the
+                // attempt ends (including this future being dropped on client disconnect).
+                let load = if policy.name() == "cache_aware" || program_completion.is_some() {
+                    Some(LoadReservation::acquire(worker.clone()))
                 } else {
                     None
                 };
@@ -1166,7 +1195,7 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            load_incremented,
+                            load,
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
@@ -1180,18 +1209,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1356,7 +1373,7 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            load_incremented,
+            load,
             prepared,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
@@ -1378,17 +1395,14 @@ impl Router {
                     .into_response();
             };
             let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
-            {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
-                    } else {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
+            // A successful stream keeps the load until its body is done; every other
+            // outcome releases it here (dropping `load`).
+            if is_stream && response.status().is_success() {
+                if let Some(worker) = load.and_then(LoadReservation::into_worker) {
+                    response = hold_load_until_body_done(response, worker);
                 }
+            } else {
+                drop(load);
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -1484,14 +1498,7 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
+                drop(load);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1525,36 +1532,22 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
+            // The body is fully read (or failed): release the load exactly once.
+            drop(load);
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
 
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
+        } else if let Some(mut load) = load {
+            // Streaming with load tracking: the forwarder owns the reservation and releases it
+            // at [DONE], or on exit (end of stream, upstream error, client gone, task dropped).
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -1576,7 +1569,6 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 loop {
@@ -1609,11 +1601,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
+                                load.release();
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -1627,12 +1615,7 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
+                load.release();
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
                 }
@@ -3578,10 +3561,10 @@ mod tests {
         let router = create_test_regular_router();
         let worker = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
         router.worker_registry.register(worker.clone());
-        if tracked { worker.increment_load(); }
+        let load = tracked.then(|| LoadReservation::acquire(worker.clone() as Arc<dyn Worker>));
         let mut response = router.send_typed_request(
             &serde_json::json!({"text":"owned test", "stream":true}),
-            TypedDispatch { headers: None, route: "/generate", worker_url: &url, is_stream: true, load_incremented: tracked, prepared: None },
+            TypedDispatch { headers: None, route: "/generate", worker_url: &url, is_stream: true, load, prepared: None },
             None,
         ).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3604,4 +3587,166 @@ mod tests {
     async fn test_stalled_stream_disconnect_before_untracked() { stalled_stream_disconnect(false, false).await; }
     #[tokio::test]
     async fn test_stalled_stream_disconnect_between_untracked() { stalled_stream_disconnect(false, true).await; }
+
+    // ── 0004: load reservations are cancellation-safe and released exactly once ──
+
+    fn cache_aware_router_with(url: &str, max_retries: u32) -> (Router, Arc<dyn Worker>) {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1 << 20,
+            },
+        ));
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.to_string(), WorkerType::Regular));
+        worker_registry.register(worker.clone());
+        let mut router = create_test_regular_router();
+        router.worker_registry = worker_registry;
+        router.policy_registry = policy_registry;
+        router.retry_config = RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        (router, worker)
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if socket.read(&mut byte).await.ok()? != 1 {
+                return None;
+            }
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8(request).unwrap();
+        let length: usize = headers.lines().find_map(|line| {
+            line.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap())
+        }).unwrap_or(0);
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.ok()?;
+        Some(headers)
+    }
+
+    /// Serve every connection with `reply` (None = read the request, then never answer).
+    async fn serve(reply: Option<&'static [u8]>) -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    if read_http_request(&mut socket).await.is_none() { return; }
+                    let _ = seen_tx.send(());
+                    match reply {
+                        Some(bytes) => { let _ = socket.write_all(bytes).await; }
+                        None => tokio::time::sleep(std::time::Duration::from_secs(30)).await,
+                    }
+                });
+            }
+        });
+        (url, seen_rx)
+    }
+
+    async fn settled_load(worker: &Arc<dyn Worker>, want: usize) -> usize {
+        // Streaming forwarders release asynchronously; wait briefly, then make sure it stays.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while worker.load() != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        worker.load()
+    }
+
+    fn gen_req(stream: bool) -> GenerateRequest {
+        serde_json::from_value(serde_json::json!({"text": "load reservation test", "stream": stream})).unwrap()
+    }
+
+    async fn client_drops_before_headers(stream: bool) {
+        let (url, mut seen) = serve(None).await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        let req = gen_req(stream);
+        let mut routed = Box::pin(router.route_typed_request(None, &req, "/generate", None));
+        tokio::select! {
+            _ = &mut routed => panic!("backend never answers"),
+            _ = seen.recv() => {}
+        }
+        assert_eq!(worker.load(), 1, "request in flight holds one load");
+        drop(routed);
+        // The handler future is gone (client disconnected before response headers).
+        assert_eq!(worker.load(), 0, "dropped request must release its load");
+    }
+    #[tokio::test]
+    async fn test_load_released_when_client_drops_before_headers_nonstream() { client_drops_before_headers(false).await; }
+    #[tokio::test]
+    async fn test_load_released_when_client_drops_before_headers_stream() { client_drops_before_headers(true).await; }
+
+    #[tokio::test]
+    async fn test_load_released_when_dropped_at_first_await() {
+        let (url, _seen) = serve(None).await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        let req = gen_req(false);
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, router.route_typed_request(None, &req, "/generate", None)).await;
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_nonstream_body_error_releases_load_once() {
+        let (url, _seen) = serve(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")).await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        worker.increment_load(); // another request in flight on this worker
+        let response = router.send_typed_request(
+            &serde_json::json!({"text": "body error", "stream": false}),
+            TypedDispatch { headers: None, route: "/generate", worker_url: &url, is_stream: false, load: Some(LoadReservation::acquire(worker.clone())), prepared: None },
+            None,
+        ).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(worker.load(), 1, "only this request's load may be released");
+    }
+
+    async fn retryable_status_releases_once(stream: bool) {
+        let (url, mut seen) = serve(Some(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")).await;
+        let (router, worker) = cache_aware_router_with(&url, 3);
+        worker.increment_load(); // another request in flight on this worker
+        let req = gen_req(stream);
+        let response = router.route_typed_request(None, &req, "/generate", None).await;
+        drop(response);
+        let mut attempts = 0;
+        while seen.try_recv().is_ok() { attempts += 1; }
+        assert!(attempts >= 2, "expected retries, got {attempts} attempt(s)");
+        assert_eq!(settled_load(&worker, 1).await, 1, "each attempt must release exactly its own load");
+    }
+    #[tokio::test]
+    async fn test_retryable_status_releases_load_once_nonstream() { retryable_status_releases_once(false).await; }
+    #[tokio::test]
+    async fn test_retryable_status_releases_load_once_stream() { retryable_status_releases_once(true).await; }
+
+    #[tokio::test]
+    async fn test_load_released_after_normal_responses() {
+        use http_body_util::BodyExt;
+        let (url, _seen) = serve(Some(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")).await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        let response = router.route_typed_request(None, &gen_req(false), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.load(), 0);
+
+        let sse: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 24\r\n\r\ndata: {}\n\ndata: [DONE]\n\n";
+        let (url, _seen) = serve(Some(sse)).await;
+        let (router, worker) = cache_aware_router_with(&url, 1);
+        let response = router.route_typed_request(None, &gen_req(true), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+        assert_eq!(settled_load(&worker, 0).await, 0);
+    }
 }
