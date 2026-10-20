@@ -264,11 +264,10 @@ impl CacheAwarePolicy {
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(max_load, min_load);
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        // Use shortest queue when imbalanced (lingjing 0006: never onto a saturated replica
+        // while an unsaturated one exists)
+        let min_load_idx =
+            pick_avoiding_saturated(workers, healthy_indices, |idx| workers[idx].load())?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -294,6 +293,31 @@ impl CacheAwarePolicy {
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
+    }
+}
+
+/// lingjing patch (0006): the `key`-minimal healthy worker, unless it is saturated
+/// (lingjing_load, opt-in) and an unsaturated one exists — then the best unsaturated one.
+fn pick_avoiding_saturated<K: Ord>(
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+    key: impl Fn(usize) -> K,
+) -> Option<usize> {
+    let best = healthy_indices.iter().copied().min_by_key(|&idx| key(idx))?;
+    if !crate::lingjing_load::avoid(workers[best].url()) {
+        return Some(best);
+    }
+    match healthy_indices
+        .iter()
+        .copied()
+        .filter(|&idx| !crate::lingjing_load::avoid(workers[idx].url()))
+        .min_by_key(|&idx| key(idx))
+    {
+        Some(idx) => {
+            crate::lingjing_load::record_avoided();
+            Some(idx)
+        }
+        None => Some(best),
     }
 }
 
@@ -399,17 +423,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // load ties by the least text held in this worker's tree, so a lightly
             // loaded fleet (every load == 0) spreads new conversations instead of
             // always picking the first healthy worker.
-            healthy_indices
-                .iter()
-                .min_by_key(|&&idx| {
-                    let held = tree
-                        .tenant_char_count
-                        .get(workers[idx].url())
-                        .map(|count| *count)
-                        .unwrap_or(0);
-                    (workers[idx].load(), held)
-                })
-                .copied()
+            // lingjing 0006: a new conversation is not placed on a saturated replica while an
+            // unsaturated one exists; the cache-hit branch above keeps its affinity regardless.
+            pick_avoiding_saturated(workers, &healthy_indices, |idx| {
+                let held = tree
+                    .tenant_char_count
+                    .get(workers[idx].url())
+                    .map(|count| *count)
+                    .unwrap_or(0);
+                (workers[idx].load(), held)
+            })
         };
 
         if let Some(idx) = selected_idx {
@@ -598,6 +621,66 @@ mod tests {
         // Both eligible workers have equal load, so the unhealthy zero-load
         // worker must not switch the policy into load-balancing mode.
         assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+    }
+
+    fn lingjing_fleet(tag: &str) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        // Unique URLs: the saturation state is process-wide.
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://lj0006-{tag}-{index}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        (policy, workers)
+    }
+
+    #[test]
+    fn new_sessions_avoid_saturated_replicas() {
+        // lingjing 0006: worker 0 would win every tie (load 0, empty tree); saturate it.
+        let (policy, workers) = lingjing_fleet("avoid");
+        let load = crate::lingjing_load::test_global();
+        load.force(workers[0].url(), true);
+        for turn in 0..6 {
+            let picked = policy.select_worker(&workers, Some(&format!("new conversation {turn}")));
+            assert_ne!(picked, Some(0), "turn {turn} landed on the saturated replica");
+        }
+        // Imbalanced (min-load) path: worker 0 is the least loaded but saturated.
+        for _ in 0..40 {
+            workers[1].increment_load();
+            workers[2].increment_load();
+        }
+        workers[2].increment_load();
+        assert_eq!(policy.select_worker(&workers, Some("imbalanced newcomer")), Some(1));
+    }
+
+    #[test]
+    fn cache_hit_keeps_affinity_on_saturated_replica() {
+        let (policy, workers) = lingjing_fleet("hit");
+        let picked = policy.select_worker(&workers, Some("long running session prefix")).unwrap();
+        crate::lingjing_load::test_global().force(workers[picked].url(), true);
+        assert_eq!(
+            policy.select_worker(&workers, Some("long running session prefix, next turn")),
+            Some(picked),
+            "an existing session must not be migrated off its KV"
+        );
+    }
+
+    #[test]
+    fn nothing_is_avoided_when_every_replica_is_saturated() {
+        let (policy, workers) = lingjing_fleet("all");
+        let load = crate::lingjing_load::test_global();
+        for worker in &workers {
+            load.force(worker.url(), true);
+        }
+        // Falls back to the ordinary choice (worker 0 wins the idle tie).
+        assert_eq!(policy.select_worker(&workers, Some("everyone is busy")), Some(0));
     }
 
     #[test]

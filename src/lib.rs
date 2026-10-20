@@ -9,6 +9,7 @@ pub mod data_connector;
 pub mod kv_hash;
 pub mod kv_index;
 pub mod lingjing_affinity;
+pub mod lingjing_load;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;

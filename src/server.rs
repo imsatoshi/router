@@ -549,6 +549,24 @@ async fn lingjing_affinity_snapshot(State(state): State<Arc<AppState>>, headers:
     Json(crate::lingjing_affinity::snapshot()).into_response()
 }
 
+/// lingjing patch (0006): instance load summary (see lingjing_load.rs); 404 when the sampler is off.
+async fn lingjing_load(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    match crate::lingjing_load::state() {
+        Some(load) => Json(load.summary(&state.context.worker_registry)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "lingjing load sampler disabled"})))
+            .into_response(),
+    }
+}
+
+/// lingjing patch (0006): router metrics live on the Prometheus port; engine load on /lingjing/load.
+async fn lingjing_metrics_not_here() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "use :29000/metrics or /lingjing/load"})))
+        .into_response()
+}
+
 /// lingjing patch: receive session→worker affinities from a peer router (see lingjing_affinity.rs).
 async fn lingjing_affinity(
     State(state): State<Arc<AppState>>,
@@ -874,7 +892,10 @@ pub fn build_app_with_wasm_middleware(
         .route("/health_generate", get(health_generate))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        // lingjing patch (0006): never let /metrics fall through to the transparent proxy,
+        // which forwarded it to one fixed worker and counted it as a processed request.
+        .route("/metrics", get(lingjing_metrics_not_here));
 
     let admin_routes = Router::new()
         .route("/add_worker", post(add_worker))
@@ -883,6 +904,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/lingjing/affinity", post(lingjing_affinity).get(lingjing_affinity_snapshot))
+        .route("/lingjing/load", get(lingjing_load))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
@@ -1116,6 +1138,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router_manager,
     });
     let router_arc = Arc::clone(&app_state.router);
+    crate::lingjing_load::start_from_env(
+        app_context.worker_registry.clone(),
+        app_context.client.clone(),
+        app_context.router_config.api_key.clone(),
+    );
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
