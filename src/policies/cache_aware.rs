@@ -149,10 +149,37 @@ impl CacheAwarePolicy {
         self
     }
 
-    fn lingjing_load(&self) -> Option<&crate::lingjing_load::LoadState> {
+    pub(crate) fn lingjing_load(&self) -> Option<&crate::lingjing_load::LoadState> {
         self.lingjing_load
             .as_deref()
             .or_else(|| crate::lingjing_load::state().map(|s| &**s))
+    }
+
+    /// lingjing 0007: would `select_worker_with_headers` take its cache-hit branch for `text`
+    /// (match rate above the threshold on a healthy worker)? Read-only: no insert, no
+    /// processed/policy counters.
+    pub(crate) fn has_cache_hit(&self, workers: &[Arc<dyn Worker>], text: &str) -> bool {
+        let healthy = get_healthy_worker_indices(workers);
+        let Some(&first) = healthy.first() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let model_id = normalize_model_key(workers[first].model_id());
+        let Some(tree) = self.trees.get(model_id).map(|entry| entry.value().clone()) else {
+            return false;
+        };
+        let result = tree.prefix_match_with_counts(text);
+        if result.input_char_count == 0 {
+            return false;
+        }
+        let match_rate = result.matched_char_count as f32 / result.input_char_count as f32;
+        let tenant: &str = &result.tenant;
+        match_rate > self.config.cache_threshold
+            && workers
+                .iter()
+                .any(|w| w.url() == tenant && w.is_healthy())
     }
 
     /// lingjing 0006: the `key`-minimal healthy worker, steered off a saturated replica for

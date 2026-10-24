@@ -48,6 +48,8 @@ pub struct Config {
     /// 0 = unknown.
     pub max_num_seqs: usize,
     pub avoid_saturated: bool,
+    /// lingjing 0007: honour `X-Lingjing-Admission: reject-if-saturated` (otherwise only count).
+    pub reject_header: bool,
 }
 
 impl Default for Config {
@@ -58,6 +60,7 @@ impl Default for Config {
             sat_waiting: 0,
             max_num_seqs: 0,
             avoid_saturated: false,
+            reject_header: false,
         }
     }
 }
@@ -72,23 +75,24 @@ impl Config {
             }
             parsed
         }
+        fn flag(name: &str) -> bool {
+            match std::env::var(name).as_deref().map(str::trim) {
+                Ok("1") | Ok("true") => true,
+                Ok("") | Ok("0") | Ok("false") | Err(_) => false,
+                Ok(other) => {
+                    warn!(name, value = other, "lingjing load: flag not 0/1/true/false, keeping it off");
+                    false
+                }
+            }
+        }
         let d = Config::default();
         Config {
             interval_ms: var("LINGJING_LOAD_INTERVAL_MS").unwrap_or(d.interval_ms),
             sat_kv: var("LINGJING_SAT_KV").unwrap_or(d.sat_kv),
             sat_waiting: var("LINGJING_SAT_WAITING").unwrap_or(d.sat_waiting),
             max_num_seqs: var("LINGJING_MAX_NUM_SEQS").unwrap_or(d.max_num_seqs),
-            avoid_saturated: match std::env::var("LINGJING_LOAD_AVOID_SATURATED")
-                .as_deref()
-                .map(str::trim)
-            {
-                Ok("1") | Ok("true") => true,
-                Ok("") | Ok("0") | Ok("false") | Err(_) => false,
-                Ok(other) => {
-                    warn!(value = other, "lingjing load: LINGJING_LOAD_AVOID_SATURATED not 0/1/true/false, keeping avoidance off");
-                    false
-                }
-            },
+            avoid_saturated: flag("LINGJING_LOAD_AVOID_SATURATED"),
+            reject_header: flag("LINGJING_LOAD_REJECT_HEADER"),
         }
     }
 
@@ -167,6 +171,8 @@ pub struct LoadState {
     any_saturated: AtomicBool,
     replicas: Mutex<HashMap<String, Replica>>,
     sampled_at_ms: Mutex<u64>,
+    /// lingjing 0007: admission decisions taken (header-carrying requests only).
+    admissions: std::sync::atomic::AtomicUsize,
 }
 
 impl LoadState {
@@ -176,6 +182,7 @@ impl LoadState {
             any_saturated: AtomicBool::new(false),
             replicas: Mutex::new(HashMap::new()),
             sampled_at_ms: Mutex::new(0),
+            admissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -272,6 +279,29 @@ impl LoadState {
             .unwrap_or_else(|e| e.into_inner())
             .get(url)
             .is_some_and(|r| r.saturated)
+    }
+
+    /// lingjing 0007: every available replica is fresh and saturated. A stale or never-sampled
+    /// replica makes this false (fail-open: no reject without a current view of every replica).
+    pub fn fresh_all_saturated(&self, registry: &WorkerRegistry) -> bool {
+        if !self.any_saturated() {
+            return false;
+        }
+        let available: Vec<_> = http_workers(registry)
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect();
+        if available.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let window = self.cfg.fresh_window();
+        let replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
+        available.iter().all(|w| {
+            replicas
+                .get(w.url())
+                .is_some_and(|r| r.saturated && r.fresh(now, window))
+        })
     }
 
     /// The `/lingjing/load` document.
@@ -402,6 +432,56 @@ pub fn place_new_session(
     Some(alt)
 }
 
+/// lingjing 0007 request header: the gateway asks for a fast 503 instead of queueing when the
+/// whole instance is saturated. The gateway sends it only when a same-model peer instance has
+/// headroom, and only on the first attempt of a request.
+pub const ADMISSION_HEADER: &str = "x-lingjing-admission";
+pub const ADMISSION_REJECT_IF_SATURATED: &str = "reject-if-saturated";
+/// Response header marking a 0007 reject, so the gateway does not treat it as a replica fault.
+pub const REJECT_HEADER: &str = "x-lingjing-reject";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// No header, or the instance has headroom: route normally.
+    Admit,
+    /// Header present and the instance is saturated, but rejecting is switched off.
+    WouldReject,
+    /// Header present, switched on, instance saturated, no cache affinity: fast 503.
+    Reject,
+}
+
+/// Decide a request that carries the admission header, before any worker is selected.
+///
+/// Reject only when every available replica is fresh and saturated and the request has no
+/// cache-affinity hit in this router (`cache_hit` is evaluated lazily, last). Never reject
+/// without a sampler (feature off) or without a current view of every replica.
+pub fn admission(
+    state: Option<&LoadState>,
+    registry: &WorkerRegistry,
+    cache_hit: impl FnOnce() -> bool,
+) -> Admission {
+    let decision = match state {
+        Some(state) if state.fresh_all_saturated(registry) && !cache_hit() => {
+            if state.cfg.reject_header {
+                Admission::Reject
+            } else {
+                Admission::WouldReject
+            }
+        }
+        _ => Admission::Admit,
+    };
+    if let Some(state) = state {
+        state.admissions.fetch_add(1, Ordering::Relaxed);
+    }
+    let result = match decision {
+        Admission::Admit => "admitted_header",
+        Admission::WouldReject => "would_reject",
+        Admission::Reject => "rejected_saturated",
+    };
+    metrics::counter!("vllm_router_lingjing_admission_total", "result" => result).increment(1);
+    decision
+}
+
 /// Start the sampler from the environment (idempotent).
 pub fn start_from_env(
     registry: Arc<WorkerRegistry>,
@@ -431,6 +511,21 @@ pub fn start_from_env(
 #[cfg(test)]
 impl LoadState {
     /// Pin a replica's hysteresis verdict (cache_aware tests).
+    /// Admission decisions taken so far (0007 tests: a reject must be decided exactly once).
+    pub(crate) fn admission_count(&self) -> usize {
+        self.admissions.load(Ordering::Relaxed)
+    }
+
+    /// Pin a replica's verdict with a fresh sample (0007 tests).
+    pub(crate) fn force_fresh(&self, url: &str, saturated: bool) {
+        let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
+        let r = replicas.entry(url.to_string()).or_default();
+        r.saturated = saturated;
+        r.last_ok = Some(Instant::now());
+        self.any_saturated
+            .store(replicas.values().any(|r| r.saturated), Ordering::Relaxed);
+    }
+
     pub(crate) fn force(&self, url: &str, saturated: bool) {
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
         replicas.entry(url.to_string()).or_default().saturated = saturated;

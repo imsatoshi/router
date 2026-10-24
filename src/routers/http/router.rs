@@ -1041,6 +1041,62 @@ impl Router {
         })
     }
 
+    /// lingjing 0007: `Some(503)` when the request asks for `reject-if-saturated`, the instance
+    /// is fully (and freshly) saturated, rejecting is switched on, and the request has no cache
+    /// affinity here. Requests without the header are not counted and never rejected.
+    fn lingjing_admission(
+        &self,
+        headers: Option<&HeaderMap>,
+        text: &str,
+        model_id: Option<&str>,
+    ) -> Option<Response> {
+        let asked = headers
+            .and_then(|h| h.get(crate::lingjing_load::ADMISSION_HEADER))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim()
+                    .eq_ignore_ascii_case(crate::lingjing_load::ADMISSION_REJECT_IF_SATURATED)
+            });
+        if !asked {
+            return None;
+        }
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>();
+        let state = cache_aware.and_then(|p| p.lingjing_load());
+        let decision = crate::lingjing_load::admission(state, &self.worker_registry, || {
+            let workers = match model_id {
+                Some(model) => self.worker_registry.get_by_model_fast(model),
+                None => self.worker_registry.get_all(),
+            };
+            let available: Vec<Arc<dyn Worker>> =
+                workers.into_iter().filter(|w| w.is_available()).collect();
+            cache_aware.is_some_and(|p| p.has_cache_hit(&available, text))
+        });
+        if decision != crate::lingjing_load::Admission::Reject {
+            return None;
+        }
+        let body = serde_json::json!({
+            "error": {
+                "message": "All replicas of this instance are saturated; retry on another instance.",
+                "type": "server_overloaded",
+                "code": "lingjing_instance_saturated",
+            }
+        });
+        let mut response = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+        let h = response.headers_mut();
+        h.insert(
+            crate::lingjing_load::REJECT_HEADER,
+            HeaderValue::from_static("saturated"),
+        );
+        h.insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        Some(response)
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -1130,6 +1186,13 @@ impl Router {
         };
 
         let text = typed_req.extract_text_for_routing();
+
+        // lingjing 0007: the gateway's opt-in fast reject, decided before RetryExecutor and before
+        // any worker is selected, so a reject is never retried here, never reserves load, never
+        // touches the prefix tree and never counts against a replica's circuit breaker.
+        if let Some(reject) = self.lingjing_admission(headers, &text, model_id) {
+            return reject;
+        }
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -3668,6 +3731,149 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         worker.load()
+    }
+
+    // ── 0007: gateway opt-in fast reject (X-Lingjing-Admission) ──
+
+    const OK_STREAM: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    struct AdmissionFixture {
+        router: Router,
+        workers: Vec<Arc<dyn Worker>>,
+        state: Arc<crate::lingjing_load::LoadState>,
+        policy: Arc<crate::policies::CacheAwarePolicy>,
+    }
+
+    fn admission_router(urls: &[String], reject_header: bool, max_retries: u32) -> AdmissionFixture {
+        let state = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            reject_header,
+            ..Default::default()
+        }));
+        let policy = Arc::new(
+            crate::policies::CacheAwarePolicy::with_config(crate::policies::CacheAwareConfig {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 0,
+                max_tree_size: 1 << 20,
+            })
+            .with_lingjing_load(state.clone()),
+        );
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = urls
+            .iter()
+            .map(|u| {
+                let w: Arc<dyn Worker> = Arc::new(BasicWorker::new(u.clone(), WorkerType::Regular));
+                worker_registry.register(w.clone());
+                policy.add_worker(w.as_ref());
+                w
+            })
+            .collect();
+        let mut router = create_test_regular_router();
+        router.worker_registry = worker_registry;
+        router.policy_registry = Arc::new(PolicyRegistry::with_default_policy(policy.clone()));
+        router.retry_config = RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        AdmissionFixture { router, workers, state, policy }
+    }
+
+    fn admission_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-lingjing-admission", HeaderValue::from_static("reject-if-saturated"));
+        h
+    }
+
+    fn admission_req() -> GenerateRequest {
+        serde_json::from_value(serde_json::json!({"text": "admission test conversation", "stream": false})).unwrap()
+    }
+
+    fn backend_hits(seen: &mut tokio::sync::mpsc::UnboundedReceiver<()>) -> usize {
+        let mut n = 0;
+        while seen.try_recv().is_ok() { n += 1; }
+        n
+    }
+
+    #[tokio::test]
+    async fn test_admission_rejects_fresh_full_saturation_before_selection() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], true, 3);
+        f.state.force_fresh(&url, true);
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("x-lingjing-reject").unwrap(), "saturated");
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(backend_hits(&mut seen), 0, "a reject never reaches a replica");
+        assert_eq!(f.state.admission_count(), 1, "decided once, outside RetryExecutor (no retry of the reject)");
+        assert_eq!(f.workers[0].load(), 0, "no load reservation for a reject");
+        assert!(f.workers[0].is_available(), "a reject does not count against the circuit breaker");
+        assert!(!f.policy.has_cache_hit(&f.workers, "admission test conversation"), "a reject does not write the prefix tree");
+    }
+
+    #[tokio::test]
+    async fn test_admission_counts_but_admits_when_switched_off() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], false, 1);
+        f.state.force_fresh(&url, true);
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-lingjing-reject").is_none());
+        assert_eq!(backend_hits(&mut seen), 1);
+        assert_eq!(f.state.admission_count(), 1, "would_reject is still decided and counted");
+    }
+
+    #[tokio::test]
+    async fn test_admission_without_header_is_untouched() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], true, 1);
+        f.state.force_fresh(&url, true);
+        let response = f.router.route_typed_request(None, &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(backend_hits(&mut seen), 1);
+        assert_eq!(f.state.admission_count(), 0, "requests without the header are not even counted");
+    }
+
+    #[tokio::test]
+    async fn test_admission_fails_open_on_stale_replica() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], true, 1);
+        f.state.force(&url, true); // saturated verdict carried over, but no fresh sample
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK, "no reject without a current view of every replica");
+        assert_eq!(backend_hits(&mut seen), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admission_admits_when_one_replica_has_headroom() {
+        let (url_a, mut seen_a) = serve(Some(OK_STREAM)).await;
+        let (url_b, mut seen_b) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url_a.clone(), url_b.clone()], true, 1);
+        f.state.force_fresh(&url_a, true);
+        f.state.force_fresh(&url_b, false);
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(backend_hits(&mut seen_a) + backend_hits(&mut seen_b), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admission_keeps_cache_affinity() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], true, 1);
+        f.policy.commit_placement(f.workers[0].model_id(), "admission test conversation", &url);
+        f.state.force_fresh(&url, true);
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::OK, "a session with a cache hit keeps its replica");
+        assert_eq!(backend_hits(&mut seen), 1);
     }
 
     fn gen_req(stream: bool) -> GenerateRequest {

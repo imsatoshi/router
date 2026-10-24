@@ -334,3 +334,17 @@ mod tests {
         assert_eq!(default.name(), "round_robin");
     }
 }
+
+#[cfg(test)]
+impl PolicyRegistry {
+    /// A registry whose default policy is `policy` (tests that need an injected policy).
+    pub(crate) fn with_default_policy(policy: Arc<dyn LoadBalancingPolicy>) -> Self {
+        Self {
+            model_policies: Arc::new(RwLock::new(HashMap::new())),
+            model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
+            default_policy: policy,
+            prefill_policy: Arc::new(RwLock::new(None)),
+            decode_policy: Arc::new(RwLock::new(None)),
+        }
+    }
+}
