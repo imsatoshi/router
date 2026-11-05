@@ -808,4 +808,78 @@ mod tests {
         };
         assert_eq!(cfg.waiting_hard(), 3);
     }
+
+    /// Counts `vllm_router_lingjing_admission_total` by its `result` label (0007 review R2).
+    #[derive(Default)]
+    struct AdmissionCounts(StdMutex<std::collections::HashMap<String, u64>>);
+
+    struct AdmissionCounter(Arc<AdmissionCounts>, String);
+
+    impl metrics::CounterFn for AdmissionCounter {
+        fn increment(&self, value: u64) {
+            *self.0 .0.lock().unwrap().entry(self.1.clone()).or_default() += value;
+        }
+        fn absolute(&self, _: u64) {}
+    }
+
+    struct AdmissionRecorder(Arc<AdmissionCounts>);
+
+    impl metrics::Recorder for AdmissionRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            if key.name() != "vllm_router_lingjing_admission_total" {
+                return metrics::Counter::noop();
+            }
+            let result = key
+                .labels()
+                .find(|l| l.key() == "result")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            metrics::Counter::from_arc(Arc::new(AdmissionCounter(self.0.clone(), result)))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn admission_metric_labels_each_decision() {
+        let registry = registry_with(&["http://a:8000", "http://b:8000"]);
+        let on = LoadState::new(Config { reject_header: true, ..Config::default() });
+        let off = LoadState::new(Config::default());
+        let counts = Arc::new(AdmissionCounts::default());
+        metrics::with_local_recorder(&AdmissionRecorder(counts.clone()), || {
+            for s in [&on, &off] {
+                s.force_fresh("http://a:8000", true);
+                s.force_fresh("http://b:8000", false);
+            }
+            assert_eq!(admission(Some(&on), &registry, || false), Admission::Admit, "one replica has headroom");
+            on.force_fresh("http://b:8000", true);
+            off.force_fresh("http://b:8000", true);
+            assert_eq!(admission(Some(&on), &registry, || true), Admission::Admit, "cache affinity wins");
+            assert_eq!(admission(Some(&on), &registry, || false), Admission::Reject);
+            assert_eq!(admission(Some(&off), &registry, || false), Admission::WouldReject);
+        });
+        let counts = counts.0.lock().unwrap();
+        assert_eq!(counts.get("admitted_header"), Some(&2));
+        assert_eq!(counts.get("rejected_saturated"), Some(&1));
+        assert_eq!(counts.get("would_reject"), Some(&1));
+    }
+
+    #[test]
+    fn admission_admits_when_no_replica_is_available() {
+        let registry = registry_with(&["http://a:8000"]);
+        let state = LoadState::new(Config { reject_header: true, ..Config::default() });
+        state.force_fresh("http://a:8000", true);
+        for w in http_workers(&registry) {
+            w.set_healthy(false);
+        }
+        assert!(!state.fresh_all_saturated(&registry), "no available replica is not 'all saturated'");
+        assert_eq!(admission(Some(&state), &registry, || false), Admission::Admit);
+    }
 }

@@ -3876,6 +3876,56 @@ mod tests {
         assert_eq!(backend_hits(&mut seen), 1);
     }
 
+    #[tokio::test]
+    async fn test_admission_no_available_replica_is_plain_503() {
+        let (url, mut seen) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url.clone()], true, 1);
+        f.state.force_fresh(&url, true);
+        f.workers[0].set_healthy(false);
+        let h = admission_headers();
+        let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get("x-lingjing-reject").is_none(),
+            "no available replica is an ordinary outage, not a 0007 reject (the gateway must cool it down)"
+        );
+        assert_eq!(backend_hits(&mut seen), 0);
+    }
+
+    #[tokio::test]
+    async fn test_admission_header_value_matching() {
+        for (value, rejects) in [
+            ("reject-if-saturated", true),
+            (" Reject-If-Saturated ", true),
+            ("reject-if-saturated-please", false),
+            ("yes", false),
+            ("", false),
+        ] {
+            let (url, _seen) = serve(Some(OK_STREAM)).await;
+            let f = admission_router(&[url.clone()], true, 1);
+            f.state.force_fresh(&url, true);
+            let mut h = HeaderMap::new();
+            h.insert("x-lingjing-admission", HeaderValue::from_str(value).unwrap());
+            let response = f.router.route_typed_request(Some(&h), &admission_req(), "/generate", None).await;
+            assert_eq!(response.headers().get("x-lingjing-reject").is_some(), rejects, "value {value:?}");
+            assert_eq!(f.state.admission_count(), usize::from(rejects), "only the exact value (trim, ASCII case) is decided: {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_has_cache_hit_ignores_unhealthy_tenant() {
+        let (url_a, _a) = serve(Some(OK_STREAM)).await;
+        let (url_b, _b) = serve(Some(OK_STREAM)).await;
+        let f = admission_router(&[url_a.clone(), url_b.clone()], true, 1);
+        f.policy.commit_placement(f.workers[0].model_id(), "admission test conversation", &url_a);
+        assert!(f.policy.has_cache_hit(&f.workers, "admission test conversation"));
+        f.workers[0].set_healthy(false);
+        assert!(
+            !f.policy.has_cache_hit(&f.workers, "admission test conversation"),
+            "affinity to an unhealthy replica is no reason to admit into a saturated instance"
+        );
+    }
+
     fn gen_req(stream: bool) -> GenerateRequest {
         serde_json::from_value(serde_json::json!({"text": "load reservation test", "stream": stream})).unwrap()
     }
