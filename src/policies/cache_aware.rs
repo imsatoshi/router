@@ -100,6 +100,8 @@ pub struct CacheAwarePolicy {
     lingjing_load: Option<Arc<crate::lingjing_load::LoadState>>,
     /// lingjing 0008: None = the process-wide state (None too while every feature is off).
     lingjing_warmup: Option<Arc<crate::lingjing_warmup::State>>,
+    /// lingjing 0009: None = the process-wide state (None too while off).
+    lingjing_uncached: Option<Arc<crate::lingjing_uncached::State>>,
 }
 
 impl CacheAwarePolicy {
@@ -143,6 +145,7 @@ impl CacheAwarePolicy {
             eviction_handle,
             lingjing_load: None,
             lingjing_warmup: None,
+            lingjing_uncached: None,
         }
     }
 
@@ -156,6 +159,52 @@ impl CacheAwarePolicy {
     pub fn with_lingjing_warmup(mut self, state: Arc<crate::lingjing_warmup::State>) -> Self {
         self.lingjing_warmup = Some(state);
         self
+    }
+
+    /// lingjing 0009: use this state instead of the process-wide one (tests).
+    pub fn with_lingjing_uncached(mut self, state: Arc<crate::lingjing_uncached::State>) -> Self {
+        self.lingjing_uncached = Some(state);
+        self
+    }
+
+    pub(crate) fn lingjing_uncached(&self) -> Option<&Arc<crate::lingjing_uncached::State>> {
+        self.lingjing_uncached
+            .as_ref()
+            .or_else(|| crate::lingjing_uncached::state())
+    }
+
+    /// lingjing 0009 time gate: is this hit better off moving? Staying costs the replica's wait
+    /// plus the new bytes; moving costs the best other replica's wait plus the whole body.
+    fn lingjing_hit_should_move(
+        &self,
+        text: &str,
+        target: usize,
+        workers: &[Arc<dyn Worker>],
+        healthy: &[usize],
+        body: Option<u64>,
+    ) -> bool {
+        use crate::lingjing_warmup::Mode;
+        let Some(state) = self.lingjing_uncached() else {
+            return false;
+        };
+        let turn = self.lingjing_warmup().and_then(|w| w.last_turn(text));
+        let last = turn.as_ref().map(|t| (t.worker.as_str(), t.body_bytes));
+        let url = workers[target].url();
+        let stay = state.wait_ms(url, state.cost(url, body, last));
+        let away = healthy
+            .iter()
+            .filter(|&&idx| idx != target)
+            .map(|&idx| state.wait_ms(workers[idx].url(), state.tokens_for(body)))
+            .min();
+        let moves = away.is_some_and(|away| state.should_move(stay, away));
+        if moves {
+            crate::lingjing_uncached::record(if state.cfg.mode == Mode::On {
+                "moved_hit"
+            } else {
+                "would_move_hit"
+            });
+        }
+        moves && state.cfg.mode == Mode::On
     }
 
     pub(crate) fn lingjing_warmup(&self) -> Option<&Arc<crate::lingjing_warmup::State>> {
@@ -285,7 +334,13 @@ impl CacheAwarePolicy {
                 workers,
                 &ranked,
                 placement,
-                |url| load.is_some_and(|l| l.is_saturated(url)),
+                |url| {
+                    load.is_some_and(|l| l.is_saturated(url))
+                        || self
+                            .lingjing_uncached()
+                            .filter(|u| u.cfg.mode == crate::lingjing_warmup::Mode::On)
+                            .is_some_and(|u| u.is_saturated(url))
+                },
                 pick,
             ),
         }
@@ -603,15 +658,19 @@ impl CacheAwarePolicy {
         // unsaturated one exists; the cache-hit branch above keeps its affinity regardless.
         // lingjing 0008: a warming worker's text counts with its credit once warmup is on.
         let warmup_on = warmup.filter(|s| s.cfg.warmup_mode == crate::lingjing_warmup::Mode::On);
+        let uncached_on = self
+            .lingjing_uncached()
+            .filter(|u| u.cfg.mode == crate::lingjing_warmup::Mode::On);
         let new_session_key = |idx: usize, credit: usize| {
             let held = tree
                 .tenant_char_count
                 .get(workers[idx].url())
                 .map(|count| *count)
                 .unwrap_or(0);
-            (workers[idx].load(), held + credit)
+            let wait = uncached_on.map_or(0, |u| u.wait_ms(workers[idx].url(), 0));
+            (wait, workers[idx].load(), held + credit)
         };
-        let pick_new = || {
+        let pick_new = |placement: crate::lingjing_warmup::Placement| {
             self.pick_new_session(workers, &healthy_indices, placement, |idx| {
                 new_session_key(idx, warmup_on.map_or(0, |s| s.credit(workers[idx].url())))
             })
@@ -642,15 +701,20 @@ impl CacheAwarePolicy {
         let selected_idx = if is_hit {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
             let target = self.lingjing_hit_target(&tree, text, &result.tenant, workers);
-            if target.is_none() && keep_on {
+            let body = placement.body_bytes;
+            if target.is_some_and(|idx| {
+                self.lingjing_hit_should_move(text, idx, workers, &healthy_indices, body)
+            }) {
+                pick_new(crate::lingjing_warmup::Placement { moved_hit: true, ..placement })
+            } else if target.is_none() && keep_on {
                 // lingjing 0008: the worker is away and nobody else holds this session.
                 crate::lingjing_warmup::record_keep_affinity("new_session", &result.tenant);
-                pick_new()
+                pick_new(placement)
             } else {
                 target
             }
         } else {
-            let chosen = pick_new();
+            let chosen = pick_new(placement);
             if let Some(state) =
                 warmup.filter(|s| s.cfg.warmup_mode == crate::lingjing_warmup::Mode::Shadow)
             {
@@ -1654,6 +1718,105 @@ mod tests {
             Some(0),
             "a whole match still is one"
         );
+    }
+
+    // ── 0009: uncached token load and the time gate ──
+
+    use crate::lingjing_uncached::{Config as Lj9Config, State as Lj9State};
+
+    fn lj9_cfg(mode: Lj8Mode) -> Lj9Config {
+        Lj9Config {
+            mode,
+            peak_tps: 1000.0,
+            bytes_per_token: 10.0,
+            max_penalty_ms: 2000,
+            sat_wait_ms: 5000,
+            max_hold_secs: 60,
+            peer_interval_ms: 1000,
+        }
+    }
+
+    /// Two replicas and a settled session on one of them.
+    fn lj9(mode: Lj8Mode) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, Arc<Lj9State>, usize) {
+        let warmup = Arc::new(Lj8State::new(Lj8Config {
+            track_sessions: true,
+            startup_grace_secs: 0,
+            ..Lj8Config::default()
+        }));
+        let uncached = Arc::new(Lj9State::new(lj9_cfg(mode)));
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 8,
+            balance_rel_threshold: 1.2,
+            eviction_interval_secs: 0,
+            max_tree_size: 1 << 24,
+        })
+        .with_lingjing_warmup(warmup)
+        .with_lingjing_uncached(uncached.clone());
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(format!("http://lj9-{i}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let home = lj9_send(&policy, &workers, SETTLED, 10_000);
+        (policy, workers, uncached, home)
+    }
+
+    fn lj9_send(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], s: &str, bytes: u64) -> usize {
+        let headers: crate::policies::RequestHeaders =
+            [("content-length".to_string(), bytes.to_string())].into();
+        policy.select_worker_with_headers(workers, Some(s), Some(&headers)).unwrap()
+    }
+
+    #[test]
+    fn uncached_new_sessions_rank_by_wait() {
+        let (policy, workers, uncached, home) = lj9(Lj8Mode::On);
+        let other = 1 - home;
+        let _busy = uncached.charge(workers[other].url(), 500);
+        assert_eq!(lj9_send(&policy, &workers, "1111000000000000", 1024), home, "the lower wait wins");
+    }
+
+    #[test]
+    fn uncached_hit_stays_inside_the_penalty_and_counts_its_delta_only() {
+        let (policy, workers, uncached, home) = lj9(Lj8Mode::On);
+        // Home waits 2s; moving costs the whole 100s body, so the gate must not open.
+        let _busy = uncached.charge(workers[home].url(), 2_000);
+        assert_eq!(lj9_send(&policy, &workers, SETTLED, 1_000_000), home);
+    }
+
+    #[test]
+    fn uncached_hit_moves_when_staying_is_slower_by_more_than_the_penalty() {
+        let (policy, workers, uncached, home) = lj9(Lj8Mode::On);
+        // Home waits 10s, moving costs 1s of prefill: 10s > 1s + 2s.
+        let _busy = uncached.charge(workers[home].url(), 10_000);
+        let (landed, seen) = counted(|| lj9_send(&policy, &workers, SETTLED, 10_000));
+        assert_eq!(landed, 1 - home);
+        assert_eq!(seen.get("vllm_router_lingjing_uncached_total:moved_hit"), Some(&1));
+    }
+
+    #[test]
+    fn uncached_shadow_counts_the_move_and_stays() {
+        let (policy, workers, uncached, home) = lj9(Lj8Mode::Shadow);
+        let _busy = uncached.charge(workers[home].url(), 10_000);
+        let (landed, seen) = counted(|| lj9_send(&policy, &workers, SETTLED, 10_000));
+        assert_eq!(landed, home);
+        assert_eq!(seen.get("vllm_router_lingjing_uncached_total:would_move_hit"), Some(&1));
+    }
+
+    #[test]
+    fn lingjing_uncached_shadow_decides_like_0007() {
+        let warmup = Arc::new(Lj8State::new(Lj8Config {
+            track_sessions: true,
+            startup_grace_secs: 0,
+            ..Lj8Config::default()
+        }));
+        let (policy, load) = trace_policy();
+        let policy = policy
+            .with_lingjing_warmup(warmup)
+            .with_lingjing_uncached(Arc::new(Lj9State::new(lj9_cfg(Lj8Mode::Shadow))));
+        assert_same_hash_trace_as_0007(lingjing_hash_trace(&policy, &load));
     }
 
     // ── 0008: route quality ──

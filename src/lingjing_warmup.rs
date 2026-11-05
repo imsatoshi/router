@@ -61,7 +61,7 @@ pub enum Mode {
 
 impl Mode {
     /// An unreadable value means off: a typo must not change routing.
-    fn parse(name: &str, raw: Option<&str>) -> Self {
+    pub(crate) fn parse(name: &str, raw: Option<&str>) -> Self {
         match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("0") | Some("off") | Some("false") => Self::Off,
             Some("1") | Some("on") | Some("true") => Self::On,
@@ -85,6 +85,8 @@ pub struct Config {
     pub keep_affinity_ttl_secs: u64,
     pub exact_session: Mode,
     pub route_quality: Mode,
+    /// lingjing 0009 reads each session's last turn, so the memo runs for it too.
+    pub track_sessions: bool,
 }
 
 impl Default for Config {
@@ -99,6 +101,7 @@ impl Default for Config {
             keep_affinity_ttl_secs: 600,
             exact_session: Mode::Off,
             route_quality: Mode::Off,
+            track_sessions: false,
         }
     }
 }
@@ -130,6 +133,7 @@ impl Config {
             ),
             exact_session: mode("LINGJING_SESSION_EXACT_MATCH"),
             route_quality: mode("LINGJING_ROUTE_QUALITY"),
+            track_sessions: mode("LINGJING_UNCACHED_MODE") != Mode::Off,
         }
     }
 
@@ -143,6 +147,7 @@ impl Config {
             || self.keep_affinity != Mode::Off
             || self.exact_session != Mode::Off
             || self.route_quality != Mode::Off
+            || self.track_sessions
     }
 }
 
@@ -181,6 +186,8 @@ struct Warm {
 pub struct LastTurn {
     pub worker: String,
     pub body_bytes: Option<u64>,
+    /// The turn before: what 0009 prices a just-selected request against.
+    pub before: Option<(String, Option<u64>)>,
 }
 
 #[derive(Debug, Default)]
@@ -191,7 +198,11 @@ struct SessionMemo {
 
 impl SessionMemo {
     /// Remember this turn; the previous one comes back.
-    fn replace(&mut self, session: &str, turn: LastTurn) -> Option<LastTurn> {
+    fn replace(&mut self, session: &str, mut turn: LastTurn) -> Option<LastTurn> {
+        turn.before = self
+            .latest
+            .get(session)
+            .map(|last| (last.worker.clone(), last.body_bytes));
         let previous = self.latest.insert(session.to_string(), turn);
         if previous.is_none() {
             self.order.push_back(session.to_string());
@@ -295,15 +306,19 @@ impl State {
     /// Route quality: compare this turn with the session's previous one. Only session hashes:
     /// a prefix text changes every turn, so it has no identity to follow.
     pub fn observe_route(&self, text: &str, worker: &str, body_bytes: Option<u64>) {
-        if self.cfg.route_quality == Mode::Off || !is_session_hash(text) {
+        let quality = self.cfg.route_quality != Mode::Off;
+        if (!quality && !self.cfg.track_sessions) || !is_session_hash(text) {
             return;
         }
-        let turn = LastTurn { worker: worker.to_string(), body_bytes };
+        let turn = LastTurn { worker: worker.to_string(), body_bytes, before: None };
         let previous = self
             .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replace(text, turn);
+        if !quality {
+            return;
+        }
         let this_turn = body_bytes.unwrap_or(0);
         let (result, bytes) = match &previous {
             None => ("first", this_turn),
@@ -323,6 +338,16 @@ impl State {
                 body_bytes = body_bytes.map(|n| n as i64).unwrap_or(-1),
             );
         }
+    }
+
+    /// The session's latest remembered turn.
+    pub fn last_turn(&self, text: &str) -> Option<LastTurn> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .latest
+            .get(text)
+            .cloned()
     }
 
     /// Move this state's clock forward (tests).
@@ -667,7 +692,7 @@ mod tests {
     #[test]
     fn lingjing_session_memo_forgets_the_oldest_past_capacity() {
         let mut memo = SessionMemo::default();
-        let turn = || LastTurn { worker: "w".into(), body_bytes: None };
+        let turn = || LastTurn { worker: "w".into(), body_bytes: None, before: None };
         for i in 0..SESSION_MEMO_CAPACITY + 1 {
             assert!(memo.replace(&i.to_string(), turn()).is_none());
         }

@@ -11,6 +11,7 @@ pub mod kv_index;
 pub mod lingjing_affinity;
 pub mod lingjing_load;
 pub mod lingjing_warmup;
+pub mod lingjing_uncached;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;

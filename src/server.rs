@@ -590,6 +590,21 @@ async fn lingjing_warmup(State(state): State<Arc<AppState>>, headers: http::Head
     }
 }
 
+/// lingjing patch (0009): this router's uncached charges for its peers; 404 when off.
+async fn lingjing_uncached(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    match crate::lingjing_uncached::state() {
+        Some(uncached) => Json(uncached.snapshot()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "lingjing uncached load disabled"})),
+        )
+            .into_response(),
+    }
+}
+
 /// lingjing patch (0006): router metrics live on the Prometheus port; engine load on /lingjing/load.
 async fn lingjing_metrics_not_here() -> Response {
     (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "use :29000/metrics or /lingjing/load"})))
@@ -935,6 +950,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/lingjing/affinity", post(lingjing_affinity).get(lingjing_affinity_snapshot))
         .route("/lingjing/load", get(lingjing_load))
         .route("/lingjing/warmup", get(lingjing_warmup))
+        .route("/lingjing/uncached", get(lingjing_uncached))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
@@ -1174,6 +1190,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_context.router_config.api_key.clone(),
     );
     crate::lingjing_warmup::start_from_env(app_context.worker_registry.clone());
+    crate::lingjing_uncached::start_from_env();
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {

@@ -224,7 +224,7 @@ fn drain(rx: &Receiver<Affinity>) -> Vec<Affinity> {
     batch
 }
 
-async fn resolve_peers(host: &str, port: u16, self_ip: &str) -> Vec<String> {
+pub(crate) async fn resolve_peers(host: &str, port: u16, self_ip: &str) -> Vec<String> {
     match tokio::net::lookup_host((host, port)).await {
         Ok(addrs) => {
             let mut v: Vec<String> = addrs

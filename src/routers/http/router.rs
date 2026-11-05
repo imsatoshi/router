@@ -75,6 +75,8 @@ fn emit_http_first_sse<E>(
 /// a retry or a panic all release it, and no path can release it twice.
 struct LoadReservation {
     worker: Option<Arc<dyn Worker>>,
+    /// lingjing 0009: this request's uncached tokens, released at its first chunk.
+    uncached: Option<crate::lingjing_uncached::Reservation>,
 }
 
 impl LoadReservation {
@@ -83,14 +85,21 @@ impl LoadReservation {
         RouterMetrics::set_running_requests(worker.url(), worker.load());
         Self {
             worker: Some(worker),
+            uncached: None,
         }
     }
 
     fn release(&mut self) {
+        self.uncached = None;
         if let Some(worker) = self.worker.take() {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
+    }
+
+    /// Prefill is over: the tokens stop counting, the request itself still does.
+    fn first_chunk(&mut self) {
+        self.uncached = None;
     }
 
     /// Hand the reservation to a response body (hold_load_until_body_done takes over the decrement).
@@ -1245,7 +1254,9 @@ impl Router {
                 // The reservation travels with the request and releases itself however the
                 // attempt ends (including this future being dropped on client disconnect).
                 let load = if policy.name() == "cache_aware" || program_completion.is_some() {
-                    Some(LoadReservation::acquire(worker.clone()))
+                    let mut load = LoadReservation::acquire(worker.clone());
+                    load.uncached = crate::lingjing_uncached::charge_selected(&text, worker.url(), headers);
+                    Some(load)
                 } else {
                     None
                 };
@@ -1651,6 +1662,7 @@ impl Router {
                         Ok(bytes) => {
                             if first_sse {
                                 first_sse = false;
+                                load.first_chunk();
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
