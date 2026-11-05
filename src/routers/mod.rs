@@ -35,6 +35,12 @@ pub trait WorkerManagement: Send + Sync {
     /// Remove a worker from the router
     fn remove_worker(&self, worker_url: &str);
 
+    /// lingjing 0008: remove a worker that may come back; routers that do not keep affinity
+    /// simply remove it.
+    fn remove_worker_keep_affinity(&self, worker_url: &str) {
+        self.remove_worker(worker_url)
+    }
+
     /// Get all worker URLs
     fn get_worker_urls(&self) -> Vec<String>;
 }

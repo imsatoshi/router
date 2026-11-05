@@ -1870,6 +1870,8 @@ impl Router {
                                 .with_health_config(self.health_config.clone());
 
                         let worker_arc = Arc::new(new_worker);
+                        // lingjing 0008: decide warming before the worker becomes routable.
+                        let warming = self.lingjing_worker_adding(worker_arc.model_id(), worker_url);
                         self.worker_registry.register(worker_arc.clone());
 
                         // Notify PolicyRegistry about the new worker
@@ -1886,6 +1888,9 @@ impl Router {
                                 let model_workers =
                                     self.worker_registry.get_by_model_fast(model_id);
                                 cache_aware.init_workers(&model_workers);
+                                if warming {
+                                    cache_aware.lingjing_seed_credit(worker_url, &model_workers);
+                                }
                             }
                         }
                     }
@@ -1914,7 +1919,58 @@ impl Router {
         }
     }
 
+    /// lingjing 0008 state of the policy serving `model_id`; None for other policies and while
+    /// every feature is off.
+    fn lingjing_warmup(&self, model_id: &str) -> Option<Arc<crate::lingjing_warmup::State>> {
+        self.policy_registry
+            .get_policy_or_default(model_id)
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            .and_then(|policy| policy.lingjing_warmup().cloned())
+    }
+
+    fn lingjing_worker_adding(&self, model_id: &str, worker_url: &str) -> bool {
+        self.lingjing_warmup(model_id).is_some_and(|state| {
+            let current = self.worker_registry.get_by_model_fast(model_id).len();
+            state.on_worker_adding(model_id, worker_url, current)
+        })
+    }
+
+    /// lingjing 0008: `POST /remove_worker?keep_affinity=1`, used by health eviction: the worker
+    /// may come back, so a warming worker stays warming. With the feature on the worker leaves
+    /// the table and its tenants stay in the tree; one that never returns is cleaned up by the
+    /// retention TTL or by a later plain `remove_worker`.
+    pub fn remove_worker_keep_affinity(&self, worker_url: &str) {
+        use crate::lingjing_warmup::{record_keep_affinity, Mode};
+        let Some(worker) = self.worker_registry.get_by_url(worker_url) else {
+            return self.remove_worker(worker_url);
+        };
+        let model_id = worker.model_id().to_string();
+        let Some(state) = self.lingjing_warmup(&model_id) else {
+            return self.remove_worker(worker_url);
+        };
+        let current = self.worker_registry.get_by_model_fast(&model_id).len();
+        state.on_worker_removed(&model_id, worker_url, current, true);
+        if state.cfg.keep_affinity != Mode::On || self.intra_node_data_parallel_size > 1 {
+            if state.cfg.keep_affinity == Mode::Shadow {
+                record_keep_affinity("would_retain", worker_url);
+            }
+            return self.remove_worker_inner(worker_url, false);
+        }
+        state.retain(worker_url);
+        if self.worker_registry.remove_by_url(worker_url).is_some() {
+            self.frontend.remove_worker(worker_url);
+            self.policy_registry.on_worker_removed(&model_id);
+            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+            record_keep_affinity("retained", worker_url);
+        }
+    }
+
     pub fn remove_worker(&self, worker_url: &str) {
+        self.remove_worker_inner(worker_url, true)
+    }
+
+    fn remove_worker_inner(&self, worker_url: &str, track: bool) {
         if self.intra_node_data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
@@ -1965,9 +2021,24 @@ impl Router {
             let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                 worker.model_id().to_string()
             } else {
+                // lingjing 0008: evicted with kept affinity, and now really gone.
+                if let Some(state) = self.lingjing_warmup("unknown") {
+                    state.forget(worker_url);
+                    if state.take_retained(worker_url) {
+                        crate::lingjing_affinity::remove_tenant(worker_url);
+                        crate::lingjing_warmup::record_keep_affinity("cleared", worker_url);
+                        return;
+                    }
+                }
                 warn!("Worker {} not found, skipping removal", worker_url);
                 return;
             };
+
+            if let Some(state) = self.lingjing_warmup(&model_id).filter(|_| track) {
+                let current = self.worker_registry.get_by_model_fast(&model_id).len();
+                state.on_worker_removed(&model_id, worker_url, current, false);
+                state.take_retained(worker_url);
+            }
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
                 self.frontend.remove_worker(worker_url);
@@ -2154,6 +2225,10 @@ impl WorkerManagement for Router {
 
     fn remove_worker(&self, worker_url: &str) {
         Router::remove_worker(self, worker_url)
+    }
+
+    fn remove_worker_keep_affinity(&self, worker_url: &str) {
+        Router::remove_worker_keep_affinity(self, worker_url)
     }
 
     fn get_worker_urls(&self) -> Vec<String> {

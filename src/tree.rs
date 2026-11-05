@@ -618,6 +618,35 @@ impl Tree {
         }
     }
 
+    /// lingjing 0008: the tenants of the node `prefix_match_with_counts` ends on, most recently
+    /// used first (URL order on ties, so the answer is deterministic). Read-only.
+    pub fn matched_tenants(&self, text: &str) -> Vec<TenantId> {
+        let mut remaining = text;
+        let mut curr = Arc::clone(&self.root);
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            let Some(child) = curr.children.get(&first_char).map(|e| e.value().clone()) else {
+                break;
+            };
+            let child_text = child.text.read().unwrap();
+            let child_chars = child_text.char_count();
+            let shared = shared_prefix_count(remaining, child_text.as_str());
+            drop(child_text);
+            curr = child;
+            if shared != child_chars {
+                break;
+            }
+            remaining = advance_by_chars(remaining, shared);
+        }
+        let mut tenants: Vec<(u64, TenantId)> = curr
+            .tenant_last_access_time
+            .iter()
+            .map(|entry| (*entry.value(), Arc::clone(entry.key())))
+            .collect();
+        tenants.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        tenants.into_iter().map(|(_, tenant)| tenant).collect()
+    }
+
     /// Legacy prefix_match API for backward compatibility.
     /// Note: This computes matched_text which has allocation overhead.
     pub fn prefix_match(&self, text: &str) -> (String, String) {

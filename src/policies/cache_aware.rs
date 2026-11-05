@@ -98,6 +98,8 @@ pub struct CacheAwarePolicy {
     eviction_handle: Option<thread::JoinHandle<()>>,
     /// lingjing 0006: saturation state; None = the process-wide sampler (if started).
     lingjing_load: Option<Arc<crate::lingjing_load::LoadState>>,
+    /// lingjing 0008: None = the process-wide state (None too while every feature is off).
+    lingjing_warmup: Option<Arc<crate::lingjing_warmup::State>>,
 }
 
 impl CacheAwarePolicy {
@@ -140,6 +142,7 @@ impl CacheAwarePolicy {
             trees,
             eviction_handle,
             lingjing_load: None,
+            lingjing_warmup: None,
         }
     }
 
@@ -147,6 +150,67 @@ impl CacheAwarePolicy {
     pub fn with_lingjing_load(mut self, load: Arc<crate::lingjing_load::LoadState>) -> Self {
         self.lingjing_load = Some(load);
         self
+    }
+
+    /// lingjing 0008: use this state instead of the process-wide one (tests).
+    pub fn with_lingjing_warmup(mut self, state: Arc<crate::lingjing_warmup::State>) -> Self {
+        self.lingjing_warmup = Some(state);
+        self
+    }
+
+    pub(crate) fn lingjing_warmup(&self) -> Option<&Arc<crate::lingjing_warmup::State>> {
+        self.lingjing_warmup
+            .as_ref()
+            .or_else(|| crate::lingjing_warmup::state())
+    }
+
+    /// lingjing 0008: seed a warming worker's credit: max(other workers' text) - its own, so
+    /// its empty tree does not win every tie. `workers` are the registered workers of the model.
+    pub(crate) fn lingjing_seed_credit(&self, url: &str, workers: &[Arc<dyn Worker>]) {
+        let (Some(state), Some(first)) = (self.lingjing_warmup(), workers.first()) else {
+            return;
+        };
+        let model_id = normalize_model_key(first.model_id());
+        let Some(tree) = self.trees.get(model_id).map(|entry| entry.value().clone()) else {
+            return;
+        };
+        let held = |worker: &str| tree.tenant_char_count.get(worker).map_or(0, |count| *count);
+        let largest = workers
+            .iter()
+            .filter(|w| w.url() != url)
+            .map(|w| held(w.url()))
+            .max()
+            .unwrap_or(0);
+        state.set_credit(url, largest.saturating_sub(held(url)));
+    }
+
+    /// The worker a hit should go to: the matched tenant, or with kept affinity another usable
+    /// tenant of the same node. The tree is not touched, so a returning worker gets its sessions
+    /// back (`last_tenant` still names it) and a session does not hop between replicas meanwhile.
+    fn lingjing_hit_target(
+        &self,
+        tree: &Tree,
+        text: &str,
+        tenant: &str,
+        workers: &[Arc<dyn Worker>],
+    ) -> Option<usize> {
+        use crate::lingjing_warmup::{record_keep_affinity, Mode};
+        let usable = |url: &str| {
+            workers
+                .iter()
+                .position(|w| w.url() == url)
+                .filter(|&idx| workers[idx].is_healthy())
+        };
+        if let Some(idx) = usable(tenant) {
+            return Some(idx);
+        }
+        let state = self.lingjing_warmup().filter(|s| s.cfg.keep_affinity == Mode::On)?;
+        state.retain(tenant);
+        let other = tree.matched_tenants(text).iter().find_map(|t| usable(t));
+        if let Some(idx) = other {
+            record_keep_affinity("other_tenant", workers[idx].url());
+        }
+        other
     }
 
     pub(crate) fn lingjing_load(&self) -> Option<&crate::lingjing_load::LoadState> {
@@ -183,21 +247,36 @@ impl CacheAwarePolicy {
     }
 
     /// lingjing 0006: the `key`-minimal healthy worker, steered off a saturated replica for
-    /// new sessions (see lingjing_load::place_new_session).
+    /// new sessions (see lingjing_load::place_new_session), and with 0008 off warming workers
+    /// (see lingjing_warmup::State::place).
     fn pick_new_session<K: Ord>(
         &self,
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
+        placement: crate::lingjing_warmup::Placement,
         key: impl Fn(usize) -> K,
     ) -> Option<usize> {
         let mut ranked = healthy_indices.to_vec();
         ranked.sort_by_key(|&idx| key(idx));
-        crate::lingjing_load::place_new_session(
-            self.lingjing_load(),
-            workers,
-            &ranked,
-            self.config.balance_abs_threshold,
-        )
+        let load = self.lingjing_load();
+        let pick = |candidates: &[usize]| {
+            crate::lingjing_load::place_new_session(
+                load,
+                workers,
+                candidates,
+                self.config.balance_abs_threshold,
+            )
+        };
+        match self.lingjing_warmup() {
+            None => pick(&ranked),
+            Some(state) => state.place(
+                workers,
+                &ranked,
+                placement,
+                |url| load.is_some_and(|l| l.is_saturated(url)),
+                pick,
+            ),
+        }
     }
 
     /// Select by the product of text-prefix affinity and current KV headroom.
@@ -310,6 +389,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         max_load: usize,
         min_load: usize,
+        placement: crate::lingjing_warmup::Placement,
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -326,8 +406,9 @@ impl CacheAwarePolicy {
 
         // Use shortest queue when imbalanced (lingjing 0006: never onto a saturated replica
         // while an unsaturated one exists)
-        let min_load_idx =
-            self.pick_new_session(workers, healthy_indices, |idx| workers[idx].load())?;
+        let min_load_idx = self.pick_new_session(workers, healthy_indices, placement, |idx| {
+            workers[idx].load()
+        })?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -361,7 +442,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
-        _headers: Option<&RequestHeaders>,
+        headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -393,15 +474,61 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             max_load, min_load, is_imbalanced
         );
 
+        let warmup = self.lingjing_warmup();
+        let mut placement = warmup.map_or_else(Default::default, |state| {
+            let count = state.cfg.warmup_mode != crate::lingjing_warmup::Mode::Off;
+            crate::lingjing_warmup::Placement::from_headers(headers, count)
+        });
+        let mut kept_match = None;
         if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                request_text,
-                &healthy_indices,
-                model_id,
-                max_load,
-                min_load,
-            );
+            // lingjing 0008: a hit on a usable, unsaturated worker stays. The match is only
+            // computed with a feature on: it refreshes tenant timestamps, and off means 0007.
+            if let Some(state) = warmup {
+                use crate::lingjing_warmup::{record_imbalance, Mode};
+                let text = request_text.unwrap_or("");
+                let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+                let matched = tree.as_ref().map(|tree| {
+                    let result = tree.prefix_match_with_counts(text);
+                    let hit = result.input_char_count > 0
+                        && result.matched_char_count as f32 / result.input_char_count as f32
+                            > self.config.cache_threshold;
+                    let target = hit
+                        .then(|| self.lingjing_hit_target(tree, text, &result.tenant, workers))
+                        .flatten();
+                    (result, hit, target)
+                });
+                match matched {
+                    Some((result, true, Some(idx))) => {
+                        let url = workers[idx].url();
+                        let saturated =
+                            self.lingjing_load().is_some_and(|load| load.is_saturated(url));
+                        match (saturated, state.cfg.keep_hit) {
+                            (false, Mode::On) => {
+                                record_imbalance("kept_hit", url);
+                                kept_match = Some(result);
+                            }
+                            (false, Mode::Shadow) => record_imbalance("would_keep_hit", url),
+                            _ => {
+                                record_imbalance("moved_hit", url);
+                                placement.moved_hit = true;
+                            }
+                        }
+                    }
+                    Some((result, true, None)) => record_imbalance("moved_hit", &result.tenant),
+                    _ => record_imbalance("moved_new", "-"),
+                }
+            }
+            if kept_match.is_none() {
+                return self.select_worker_min_load(
+                    workers,
+                    request_text,
+                    &healthy_indices,
+                    model_id,
+                    max_load,
+                    min_load,
+                    placement,
+                );
+            }
         }
 
         // Use cache-aware routing when balanced
@@ -434,7 +561,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         debug!("Using cache-aware routing for model '{}'", model_id);
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
+        let result = kept_match.unwrap_or_else(|| tree.prefix_match_with_counts(text));
         let match_rate = if result.input_char_count == 0 {
             0.0
         } else {
@@ -445,29 +572,62 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
             model_id, result.matched_char_count, result.input_char_count, match_rate
         );
+        // Low cache match: use worker with minimum load. lingjing patch: break
+        // load ties by the least text held in this worker's tree, so a lightly
+        // loaded fleet (every load == 0) spreads new conversations instead of
+        // always picking the first healthy worker.
+        // lingjing 0006: a new conversation is not placed on a saturated replica while an
+        // unsaturated one exists; the cache-hit branch above keeps its affinity regardless.
+        // lingjing 0008: a warming worker's text counts with its credit once warmup is on.
+        let warmup_on = warmup.filter(|s| s.cfg.warmup_mode == crate::lingjing_warmup::Mode::On);
+        let new_session_key = |idx: usize, credit: usize| {
+            let held = tree
+                .tenant_char_count
+                .get(workers[idx].url())
+                .map(|count| *count)
+                .unwrap_or(0);
+            (workers[idx].load(), held + credit)
+        };
+        let pick_new = || {
+            self.pick_new_session(workers, &healthy_indices, placement, |idx| {
+                new_session_key(idx, warmup_on.map_or(0, |s| s.credit(workers[idx].url())))
+            })
+        };
+
         // Select worker without String allocation
+        let keep_on = warmup
+            .is_some_and(|s| s.cfg.keep_affinity == crate::lingjing_warmup::Mode::On);
         let selected_idx = if match_rate > self.config.cache_threshold {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
+            let target = self.lingjing_hit_target(&tree, text, &result.tenant, workers);
+            if target.is_none() && keep_on {
+                // lingjing 0008: the worker is away and nobody else holds this session.
+                crate::lingjing_warmup::record_keep_affinity("new_session", &result.tenant);
+                pick_new()
+            } else {
+                target
+            }
         } else {
-            // Low cache match: use worker with minimum load. lingjing patch: break
-            // load ties by the least text held in this worker's tree, so a lightly
-            // loaded fleet (every load == 0) spreads new conversations instead of
-            // always picking the first healthy worker.
-            // lingjing 0006: a new conversation is not placed on a saturated replica while an
-            // unsaturated one exists; the cache-hit branch above keeps its affinity regardless.
-            self.pick_new_session(workers, &healthy_indices, |idx| {
-                let held = tree
-                    .tenant_char_count
-                    .get(workers[idx].url())
-                    .map(|count| *count)
-                    .unwrap_or(0);
-                (workers[idx].load(), held)
-            })
+            let chosen = pick_new();
+            if let Some(state) =
+                warmup.filter(|s| s.cfg.warmup_mode == crate::lingjing_warmup::Mode::Shadow)
+            {
+                // Shadow: would the credit alone have sent this session elsewhere?
+                let credited = healthy_indices
+                    .iter()
+                    .copied()
+                    .min_by_key(|&idx| new_session_key(idx, state.credit(workers[idx].url())));
+                if let (Some(actual), Some(would)) = (chosen, credited) {
+                    if actual != would && state.has_warming(workers, &[actual]) {
+                        crate::lingjing_warmup::record_warmup(
+                            "would_shift_credit",
+                            workers[actual].url(),
+                            placement.body_bytes,
+                        );
+                    }
+                }
+            }
+            chosen
         };
 
         if let Some(idx) = selected_idx {
@@ -486,12 +646,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Selected worker no longer exists or unhealthy, remove stale tenant from tree
         if match_rate > self.config.cache_threshold {
             let tenant_url: &str = &result.tenant;
+            if warmup.is_some_and(|s| s.cfg.keep_affinity == crate::lingjing_warmup::Mode::Shadow) {
+                crate::lingjing_warmup::record_keep_affinity("would_retain", tenant_url);
+            }
             tree.remove_tenant(tenant_url);
             debug!("Removed stale worker {} from cache tree", tenant_url);
         }
 
-        // Fallback to first healthy worker
-        if let Some(idx) = healthy_indices.first().copied() {
+        // Fallback to first healthy worker (lingjing 0008: not a warming one while there are others)
+        let settled = warmup_on.and_then(|state| {
+            healthy_indices
+                .iter()
+                .copied()
+                .find(|&idx| !state.is_warming(workers[idx].url()))
+        });
+        if let Some(idx) = settled.or_else(|| healthy_indices.first().copied()) {
             workers[idx].increment_processed();
             RouterMetrics::record_processed_request(workers[idx].url());
             RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
@@ -772,6 +941,692 @@ mod tests {
         // workers[1].load() == 8, workers[0].load() == 0
         assert_eq!(crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 8), Some(0));
         assert_eq!(crate::lingjing_load::place_new_session(Some(&load), &workers, &[0, 1], 9), Some(1));
+    }
+
+    // ── 0008: decision trace shared with the 0007 golden file ──
+
+    /// Deterministic scripted traffic over the whole selection surface: new and returning
+    /// sessions, long texts, load swings past the imbalance thresholds, saturation flips,
+    /// scale-out, eviction + re-add, a replica going unhealthy, a stale tenant. One line per
+    /// decision, plus each tree's per-worker text size at the end of every phase.
+    fn lingjing_decision_trace(
+        policy: &CacheAwarePolicy,
+        load: &crate::lingjing_load::LoadState,
+        on_add: &dyn Fn(&str, usize),
+    ) -> String {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % bound
+        };
+        let pool: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(format!("http://trace-{i}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        let mut active: Vec<Arc<dyn Worker>> = pool[..2].to_vec();
+        policy.init_workers(&active);
+        let mut out = String::new();
+        let mut sessions: Vec<String> = Vec::new();
+        let mut held: Vec<Arc<dyn Worker>> = Vec::new();
+        let mut placed: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut serial = 0x4e00u32;
+        let mut fresh = move |r: u64| {
+            serial += 1;
+            format!("{}{r:015x}", char::from_u32(serial).unwrap())
+        };
+        for (phase, ops) in [300u32, 300, 200, 200, 200, 200].into_iter().enumerate() {
+            match phase {
+                1 => {
+                    on_add(pool[2].url(), active.len());
+                    active.push(pool[2].clone());
+                    policy.init_workers(&active);
+                }
+                2 => {
+                    policy.remove_worker_by_url(pool[1].url());
+                    active.remove(1);
+                }
+                3 => {
+                    on_add(pool[1].url(), active.len());
+                    active.insert(1, pool[1].clone());
+                    policy.init_workers(&active);
+                }
+                4 => pool[2].set_healthy(false),
+                5 => {
+                    // Tenant left in the tree, worker gone from the list (open breaker).
+                    pool[2].set_healthy(true);
+                    active.retain(|w| w.url() != pool[2].url());
+                }
+                _ => {}
+            }
+            for op in 0..ops {
+                match next(9) {
+                    0..=2 => {
+                        let w = active[next(active.len() as u64) as usize].clone();
+                        for _ in 0..=next(5) {
+                            w.increment_load();
+                            held.push(w.clone());
+                        }
+                    }
+                    3..=4 => {
+                        for _ in 0..next(8) {
+                            if !held.is_empty() {
+                                held.swap_remove(next(held.len() as u64) as usize).decrement_load();
+                            }
+                        }
+                    }
+                    5 => load.force(active[next(active.len() as u64) as usize].url(), next(2) == 0),
+                    _ => {}
+                }
+                let text = match next(5) {
+                    0 | 1 if !sessions.is_empty() => {
+                        let again = sessions[next(sessions.len() as u64) as usize].clone();
+                        // Once tenants have been removed, a node holding several tenants picks
+                        // its survivor by DashMap order (random per process, in 0007 too):
+                        // sessions placed on more than one worker are not replayed then, and
+                        // every session starts with its own character so nodes are not shared.
+                        if phase >= 2 && placed.get(&again).is_some_and(|w| w.len() > 1) {
+                            fresh(next(u64::MAX))
+                        } else {
+                            again
+                        }
+                    }
+                    2 => {
+                        let s = fresh(next(u64::MAX));
+                        sessions.push(s.clone());
+                        s
+                    }
+                    3 => {
+                        let s = fresh(next(u64::MAX)).repeat(12);
+                        sessions.push(s.clone());
+                        s
+                    }
+                    _ => fresh(next(u64::MAX)),
+                };
+                let headers: Option<crate::policies::RequestHeaders> = match next(3) {
+                    0 => None,
+                    1 => Some([("content-length".to_string(), "1024".to_string())].into()),
+                    _ => Some([("content-length".to_string(), "4194304".to_string())].into()),
+                };
+                let picked = policy
+                    .select_worker_with_headers(&active, Some(&text), headers.as_ref())
+                    .map(|idx| active[idx].url().to_string());
+                if let Some(url) = &picked {
+                    placed.entry(text).or_default().insert(url.clone());
+                }
+                out.push_str(&format!("{phase}.{op} {}\n", picked.as_deref().unwrap_or("none")));
+            }
+            let tree = policy.trees.get("default").unwrap().value().clone();
+            let mut sizes: Vec<_> = tree.get_used_size_per_tenant().into_iter().collect();
+            sizes.sort();
+            out.push_str(&format!("phase {phase} tree {sizes:?}\n"));
+        }
+        out
+    }
+
+    fn trace_policy() -> (CacheAwarePolicy, Arc<crate::lingjing_load::LoadState>) {
+        let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            avoid_saturated: true,
+            ..Default::default()
+        }));
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 8,
+            balance_rel_threshold: 1.2,
+            eviction_interval_secs: 0,
+            max_tree_size: 1 << 24,
+        })
+        .with_lingjing_load(load.clone());
+        (policy, load)
+    }
+
+    const GOLDEN_0007: &str = include_str!("../../tests/fixtures/lingjing_0007_decisions.txt");
+
+    fn assert_same_as_0007(trace: String) {
+        for (line, (got, want)) in trace.lines().zip(GOLDEN_0007.lines()).enumerate() {
+            assert_eq!(got, want, "first difference from 0007 at line {}", line + 1);
+        }
+        assert_eq!(trace.lines().count(), GOLDEN_0007.lines().count());
+    }
+
+    #[test]
+    fn lingjing_all_off_decides_exactly_like_0007() {
+        let (policy, load) = trace_policy();
+        assert_same_as_0007(lingjing_decision_trace(&policy, &load, &|_, _| {}));
+    }
+
+    #[test]
+    fn lingjing_all_shadow_decides_exactly_like_0007() {
+        use crate::lingjing_warmup::{Config, Mode, State};
+        let state = Arc::new(State::new(Config {
+            warmup_mode: Mode::Shadow,
+            keep_hit: Mode::Shadow,
+            keep_affinity: Mode::Shadow,
+            startup_grace_secs: 0,
+            ..Config::default()
+        }));
+        let (policy, load) = trace_policy();
+        let policy = policy.with_lingjing_warmup(state.clone());
+        let on_add = |url: &str, current: usize| {
+            state.on_worker_adding("default", url, current);
+            state.set_credit(url, 1 << 20);
+        };
+        assert_same_as_0007(lingjing_decision_trace(&policy, &load, &on_add));
+        assert!(state.is_warming("http://trace-2:8000"), "shadow really saw the scale-out");
+    }
+
+    // ── 0008: slow start, hits stay, eviction keeps affinity ──
+
+    use crate::lingjing_warmup::{Config as Lj8Config, Mode as Lj8Mode, State as Lj8State};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
+
+    const KIB256: u64 = 262_144;
+
+    struct Lj8 {
+        policy: CacheAwarePolicy,
+        workers: Vec<Arc<dyn Worker>>,
+        load: Arc<crate::lingjing_load::LoadState>,
+        state: Arc<Lj8State>,
+    }
+
+    fn lj8(cfg: Lj8Config, replicas: usize) -> Lj8 {
+        let state = Arc::new(Lj8State::new(Lj8Config { startup_grace_secs: 0, ..cfg }));
+        let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
+            avoid_saturated: true,
+            ..Default::default()
+        }));
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 8,
+            balance_rel_threshold: 1.2,
+            eviction_interval_secs: 0,
+            max_tree_size: 1 << 24,
+        })
+        .with_lingjing_load(load.clone())
+        .with_lingjing_warmup(state.clone());
+        let workers: Vec<Arc<dyn Worker>> = (0..replicas)
+            .map(|i| {
+                Arc::new(BasicWorker::new(format!("http://lj8-{i}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        // Baseline: this count is the fleet, not a scale-out.
+        state.on_worker_removed("default", "baseline", replicas, false);
+        Lj8 { policy, workers, load, state }
+    }
+
+    impl Lj8 {
+        /// What `Router::add_worker` does.
+        fn scale_out(&mut self) -> usize {
+            let url = format!("http://lj8-{}:8000", self.workers.len());
+            let warming = self.state.on_worker_adding("default", &url, self.workers.len());
+            self.workers
+                .push(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+            self.policy.init_workers(&self.workers);
+            if warming {
+                self.policy.lingjing_seed_credit(&url, &self.workers);
+            }
+            self.workers.len() - 1
+        }
+
+        fn send(&self, session: &str, bytes: Option<u64>) -> usize {
+            self.send_to(&self.workers, session, bytes)
+        }
+
+        fn send_to(&self, workers: &[Arc<dyn Worker>], session: &str, bytes: Option<u64>) -> usize {
+            let headers: Option<crate::policies::RequestHeaders> =
+                bytes.map(|b| [("content-length".to_string(), b.to_string())].into());
+            self.policy
+                .select_worker_with_headers(workers, Some(session), headers.as_ref())
+                .unwrap()
+        }
+
+        fn load(&self, idx: usize, requests: usize) {
+            for _ in 0..requests {
+                self.workers[idx].increment_load();
+            }
+        }
+
+        fn without(&self, gone: usize) -> Vec<Arc<dyn Worker>> {
+            let mut left = self.workers.clone();
+            left.remove(gone);
+            left
+        }
+
+        fn tenants(&self, session: &str) -> usize {
+            self.policy.trees.get("default").unwrap().matched_tenants(session).len()
+        }
+    }
+
+    fn on(warmup: Lj8Mode, keep_hit: Lj8Mode, keep_affinity: Lj8Mode) -> Lj8Config {
+        Lj8Config { warmup_mode: warmup, keep_hit, keep_affinity, ..Lj8Config::default() }
+    }
+
+    /// A session hash like the gateway's: 16 hex chars sharing no meaningful prefix.
+    fn sid(tag: u64, i: u64) -> String {
+        format!("{:016x}", (tag << 32 | i).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23))
+    }
+
+    /// Spread `n` sessions over a fleet, each one small.
+    fn seed_sessions(f: &Lj8, n: usize) -> BTreeMap<String, usize> {
+        (0..n)
+            .map(|i| {
+                let session = sid(1, i as u64);
+                let placed = f.send(&session, Some(1024));
+                (session, placed)
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Default)]
+    struct Counts(Arc<Mutex<BTreeMap<String, u64>>>);
+
+    impl metrics::Recorder for Counts {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            let label = key.labels().map(|l| l.value().to_string()).collect::<Vec<_>>().join(",");
+            metrics::Counter::from_arc(Arc::new(CountHandle(
+                self.0.clone(),
+                format!("{}:{label}", key.name()),
+            )))
+        }
+
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    struct CountHandle(Arc<Mutex<BTreeMap<String, u64>>>, String);
+
+    impl metrics::CounterFn for CountHandle {
+        fn increment(&self, value: u64) {
+            *self.0.lock().unwrap().entry(self.1.clone()).or_default() += value;
+        }
+
+        fn absolute(&self, _: u64) {}
+    }
+
+    fn counted<T>(run: impl FnOnce() -> T) -> (T, BTreeMap<String, u64>) {
+        let counts = Counts::default();
+        let out = metrics::with_local_recorder(&counts, run);
+        let seen = counts.0.lock().unwrap().clone();
+        (out, seen)
+    }
+
+    fn warmup_count(seen: &BTreeMap<String, u64>, result: &str) -> u64 {
+        seen.get(&format!("vllm_router_lingjing_warmup_total:{result}")).copied().unwrap_or(0)
+    }
+
+    fn imbalance_count(seen: &BTreeMap<String, u64>, action: &str) -> u64 {
+        seen.get(&format!("vllm_router_lingjing_imbalance_total:{action}")).copied().unwrap_or(0)
+    }
+
+    // Design §2.3 probes, reversed where the design wants them reversed.
+
+    #[test]
+    fn probe_known_sessions_never_move_on_scale_out() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::On, Lj8Mode::On), 2);
+        let sessions = seed_sessions(&f, 2000);
+        f.scale_out();
+        let moved = sessions.iter().filter(|(s, placed)| f.send(s, Some(4 << 20)) != **placed).count();
+        assert_eq!(moved, 0, "of 2000 known sessions, even with large bodies");
+    }
+
+    #[test]
+    fn probe_new_sessions_used_to_all_land_on_the_empty_replica() {
+        let mut f = lj8(on(Lj8Mode::Off, Lj8Mode::Off, Lj8Mode::Off), 2);
+        seed_sessions(&f, 2000);
+        let fresh = f.scale_out();
+        let landed = (0..1000).filter(|&i| f.send(&sid(2, i), Some(1024)) == fresh).count();
+        // A few random hashes share five characters with a seeded one and count as hits.
+        assert!(landed >= 990, "the §2.3 behaviour this patch exists to change: {landed}");
+    }
+
+    #[test]
+    fn probe_slow_start_shares_new_sessions_instead_of_flooding() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        seed_sessions(&f, 2000);
+        let fresh = f.scale_out();
+        let mut landed = [0usize; 3];
+        for i in 0..3000 {
+            landed[f.send(&sid(2, i), Some(1024))] += 1;
+        }
+        assert!(
+            landed.iter().all(|n| (900..=1100).contains(n)),
+            "small new sessions spread roughly evenly: {landed:?}"
+        );
+        assert!(landed[fresh] > 0);
+    }
+
+    #[test]
+    fn probe_imbalance_used_to_move_hits_and_keep_hit_stops_it() {
+        for (keep, stays) in [(Lj8Mode::Off, false), (Lj8Mode::On, true)] {
+            let mut f = lj8(on(Lj8Mode::Off, keep, Lj8Mode::Off), 2);
+            let home = f.send("session-a-000000", Some(1024));
+            let other = 1 - home;
+            let fresh = f.scale_out();
+            f.load(home, 9);
+            f.load(other, 9);
+            let picked = f.send("session-a-000000", Some(1024));
+            assert_eq!(picked == home, stays, "{keep:?}");
+            assert_eq!(picked == fresh, !stays, "{keep:?}");
+        }
+    }
+
+    #[test]
+    fn slow_start_credit_with_uneven_old_trees_pins_the_design_formula() {
+        // credit = max(others) - own (design §4.1): the smaller old tree fills up first.
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let tree = f.policy.trees.get("default").unwrap().clone();
+        for i in 0..3000 {
+            tree.insert(&sid(11, i), f.workers[0].url());
+        }
+        for i in 0..1000 {
+            tree.insert(&sid(12, i), f.workers[1].url());
+        }
+        let fresh = f.scale_out();
+        let mut landed = [0usize; 3];
+        for i in 0..1500 {
+            landed[f.send(&sid(13, i), Some(1024))] += 1;
+        }
+        assert_eq!(landed[fresh], 0, "nothing until worker 1 has caught up: {landed:?}");
+        assert!(landed[1] >= 1490, "{landed:?}");
+    }
+
+    #[test]
+    fn warmup_gate_is_exactly_at_the_threshold() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let fresh = f.scale_out();
+        f.state.set_credit(f.workers[fresh].url(), 0); // empty trees: fresh wins the tie
+        f.load(0, 1);
+        f.load(1, 1);
+        assert_eq!(f.send(&sid(8, 1), Some(KIB256 - 1)), fresh);
+        assert_ne!(f.send(&sid(8, 2), Some(KIB256)), fresh);
+    }
+
+    #[test]
+    fn warmup_unknown_length_counts_as_large() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let fresh = f.scale_out();
+        f.state.set_credit(f.workers[fresh].url(), 0);
+        f.load(0, 1);
+        f.load(1, 1);
+        let (_, seen) = counted(|| {
+            assert_ne!(f.send(&sid(3, 1), None), fresh);
+            let headers: crate::policies::RequestHeaders =
+                [("content-length".to_string(), "garbage".to_string())].into();
+            let picked = f.policy.select_worker_with_headers(
+                &f.workers,
+                Some(&sid(3, 2)),
+                Some(&headers),
+            );
+            assert_ne!(picked, Some(fresh));
+        });
+        assert_eq!(warmup_count(&seen, "no_length"), 2);
+        assert_eq!(warmup_count(&seen, "blocked_long"), 2);
+    }
+
+    #[test]
+    fn warmup_large_sessions_never_reach_the_warming_replica() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        seed_sessions(&f, 200);
+        let fresh = f.scale_out();
+        for i in 0..300 {
+            let body = KIB256 + i * 4096;
+            assert_ne!(f.send(&sid(4, i), Some(body)), fresh);
+        }
+    }
+
+    #[test]
+    fn warmup_opens_only_when_every_other_replica_is_saturated() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let fresh = f.scale_out();
+        f.load(0, 1);
+        f.load(1, 1);
+        f.state.set_credit(f.workers[fresh].url(), 0);
+        f.load.force(f.workers[0].url(), true);
+        assert_eq!(f.send(&sid(9, 1), Some(4 << 20)), 1, "one other replica is free");
+        f.workers[1].decrement_load();
+        f.load.force(f.workers[1].url(), true);
+        let (picked, seen) = counted(|| f.send(&sid(9, 2), Some(4 << 20)));
+        assert_eq!(picked, fresh, "scale-out must help once the old replicas are full");
+        assert_eq!(warmup_count(&seen, "bypass_saturated"), 1);
+    }
+
+    #[test]
+    fn warmup_ends_and_the_credit_keeps_preventing_a_flood() {
+        let mut f = lj8(
+            Lj8Config { warmup_secs: 60, ..on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off) },
+            2,
+        );
+        seed_sessions(&f, 500);
+        let fresh = f.scale_out();
+        f.state.advance(std::time::Duration::from_secs(61));
+        assert!(!f.state.is_warming(f.workers[fresh].url()));
+        let mut landed = [0usize; 3];
+        for i in 0..600 {
+            landed[f.send(&sid(5, i), Some(4 << 20))] += 1;
+        }
+        assert!(landed[fresh] > 0, "large sessions may enter after the window: {landed:?}");
+        assert!(landed[fresh] < 300, "no flood when the window opens: {landed:?}");
+    }
+
+    #[test]
+    fn warmup_shadow_counts_but_routes_like_off() {
+        let mut f = lj8(on(Lj8Mode::Shadow, Lj8Mode::Off, Lj8Mode::Off), 2);
+        seed_sessions(&f, 100);
+        let fresh = f.scale_out();
+        let (picked, seen) = counted(|| {
+            (f.send(&sid(6, 1), Some(4 << 20)), f.send(&sid(6, 2), Some(1024)))
+        });
+        assert_eq!(picked, (fresh, fresh), "shadow keeps the 0007 flood");
+        assert_eq!(warmup_count(&seen, "would_block_long"), 1);
+        assert_eq!(warmup_count(&seen, "allowed_short"), 1);
+        assert_eq!(warmup_count(&seen, "would_shift_credit"), 2);
+        assert_eq!(warmup_count(&seen, "blocked_long"), 0);
+    }
+
+    #[test]
+    fn warmup_hits_keep_going_to_a_warming_replica() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let fresh = f.scale_out();
+        f.state.set_credit(f.workers[fresh].url(), 0);
+        f.load(0, 1);
+        f.load(1, 1);
+        assert_eq!(f.send("small-then-large", Some(1024)), fresh);
+        assert_eq!(f.send("small-then-large", Some(8 << 20)), fresh);
+    }
+
+    #[test]
+    fn warmup_rolling_restart_is_not_a_scale_out() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 3);
+        let gone = f.workers.remove(2);
+        f.state.on_worker_removed("default", gone.url(), 3, false);
+        f.policy.remove_worker_by_url(gone.url());
+        let replacement = f.scale_out();
+        assert!(!f.state.is_warming(f.workers[replacement].url()));
+        assert_eq!(f.state.credit(f.workers[replacement].url()), 0);
+    }
+
+    #[test]
+    fn warmup_scale_in_forgets_the_replica() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::On, Lj8Mode::On), 2);
+        let fresh = f.scale_out();
+        let url = f.workers[fresh].url().to_string();
+        f.state.on_worker_removed("default", &url, 3, false);
+        assert!(!f.state.is_warming(&url));
+        assert_eq!(f.state.credit(&url), 0);
+    }
+
+    #[test]
+    fn two_routers_reach_the_same_gate_decisions() {
+        // Each router has its own tree and clock; the gate depends on neither.
+        let mut a = lj8(on(Lj8Mode::On, Lj8Mode::On, Lj8Mode::On), 2);
+        let mut b = lj8(on(Lj8Mode::On, Lj8Mode::On, Lj8Mode::On), 2);
+        // Sessions are pinned to one router, so their trees differ.
+        seed_sessions(&a, 40);
+        let fresh_a = a.scale_out();
+        b.state.advance(std::time::Duration::from_secs(5));
+        let fresh_b = b.scale_out();
+        for i in 0..200u64 {
+            let session = sid(7, i);
+            let body = if i % 3 == 0 { KIB256 + i } else { 2048 };
+            let (pa, pb) = (a.send(&session, Some(body)), b.send(&session, Some(body)));
+            if body >= KIB256 {
+                assert!(pa != fresh_a && pb != fresh_b, "request {i}");
+            }
+        }
+        assert_eq!(a.state.is_warming(a.workers[fresh_a].url()), b.state.is_warming(b.workers[fresh_b].url()));
+    }
+
+    #[test]
+    fn restarted_router_adopts_the_window_and_the_credit() {
+        let mut a = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        seed_sessions(&a, 200);
+        let fresh = a.scale_out();
+        let b = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 3);
+        assert_eq!(b.state.apply_peer(&a.state.snapshot()), 1);
+        assert_ne!(b.send("restart-large-01", Some(4 << 20)), fresh);
+        assert!(b.state.credit(b.workers[fresh].url()) > 0);
+    }
+
+    #[test]
+    fn keep_hit_only_on_a_usable_unsaturated_worker() {
+        let mut f = lj8(on(Lj8Mode::Off, Lj8Mode::On, Lj8Mode::Off), 2);
+        let home = f.send("session-b-000000", Some(1024));
+        let fresh = f.scale_out();
+        f.load(home, 9);
+        let other = 1 - home;
+        f.load(other, 9);
+
+        let (picked, seen) = counted(|| f.send("session-b-000000", Some(1024)));
+        assert_eq!(picked, home);
+        assert_eq!(imbalance_count(&seen, "kept_hit"), 1);
+
+        f.load.force(f.workers[home].url(), true);
+        let (picked, seen) = counted(|| f.send("session-b-000000", Some(1024)));
+        assert_eq!(picked, fresh, "a saturated target moves as before");
+        assert_eq!(imbalance_count(&seen, "moved_hit"), 1);
+
+        let (picked, seen) = counted(|| f.send(&sid(10, 1), Some(1024)));
+        assert_eq!(picked, fresh);
+        assert_eq!(imbalance_count(&seen, "moved_new"), 1);
+    }
+
+    #[test]
+    fn keep_hit_shadow_counts_and_still_moves() {
+        let mut f = lj8(on(Lj8Mode::Off, Lj8Mode::Shadow, Lj8Mode::Off), 2);
+        let home = f.send("session-c-000000", Some(1024));
+        let fresh = f.scale_out();
+        f.load(0, 9);
+        f.load(1, 9);
+        let (picked, seen) = counted(|| f.send("session-c-000000", Some(1024)));
+        assert_eq!(picked, fresh);
+        assert_ne!(picked, home);
+        assert_eq!(imbalance_count(&seen, "would_keep_hit"), 1);
+        assert_eq!(imbalance_count(&seen, "kept_hit"), 0);
+    }
+
+    #[test]
+    fn moved_hit_prefers_a_replica_that_is_not_warming() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::On, Lj8Mode::Off), 3);
+        let home = f.send("session-d-000000", Some(1024));
+        let fresh = f.scale_out();
+        let settled = (0..3).find(|&i| i != home).unwrap();
+        for i in 0..3 {
+            f.load(i, if i == settled { 9 } else { 10 });
+        }
+        f.load.force(f.workers[home].url(), true);
+        assert_eq!(
+            f.send("session-d-000000", Some(1024)),
+            settled,
+            "the least loaded worker is warming, but a small moved hit stays off it too"
+        );
+        assert_eq!(f.workers[fresh].load(), 0);
+    }
+
+    #[test]
+    fn evicted_worker_gets_its_sessions_back() {
+        let f = lj8(on(Lj8Mode::Off, Lj8Mode::Off, Lj8Mode::On), 3);
+        let home = f.send("session-e-000000", Some(1024));
+        let left = f.without(home);
+        let during = f.send_to(&left, "session-e-000000", Some(1024));
+        for _ in 0..10 {
+            assert_eq!(f.send_to(&left, "session-e-000000", Some(1024)), during, "no hopping");
+        }
+        assert!(f.state.is_retained(f.workers[home].url()));
+        assert_eq!(f.tenants("session-e-000000"), 2, "the evicted tenant is still in the tree");
+        assert_eq!(f.send("session-e-000000", Some(1024)), home, "back on its KV");
+    }
+
+    #[test]
+    fn eviction_off_and_shadow_delete_the_tenant_like_0007() {
+        for mode in [Lj8Mode::Off, Lj8Mode::Shadow] {
+            let f = lj8(on(Lj8Mode::Off, Lj8Mode::Off, mode), 3);
+            let home = f.send("session-f-000000", Some(1024));
+            let left = f.without(home);
+            let _ = f.send_to(&left, "session-f-000000", Some(1024));
+            assert!(!f.state.is_retained(f.workers[home].url()), "{mode:?}");
+            let held = f.policy.trees.get("default").unwrap().get_used_size_per_tenant();
+            assert!(!held.contains_key(f.workers[home].url()), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn eviction_ttl_removes_tenants_of_a_worker_that_never_returns() {
+        let f = lj8(on(Lj8Mode::Off, Lj8Mode::Off, Lj8Mode::On), 3);
+        let home = f.send("session-g-000000", Some(1024));
+        let url = f.workers[home].url().to_string();
+        let left = f.without(home);
+        let during = f.send_to(&left, "session-g-000000", Some(1024));
+        f.state.advance(std::time::Duration::from_secs(600));
+        f.state.purge_retained(|_| false, |gone| f.policy.remove_worker_by_url(gone));
+        let tree = f.policy.trees.get("default").unwrap().clone();
+        assert!(!tree.get_used_size_per_tenant().contains_key(&url));
+        assert_eq!(f.send_to(&left, "session-g-000000", Some(1024)), during);
+    }
+
+    #[test]
+    fn eviction_with_kept_affinity_does_not_bring_large_sessions_to_a_warming_replica() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::On), 2);
+        let home = f.send("session-h-000000", Some(8 << 20));
+        let fresh = f.scale_out();
+        let left = f.without(home);
+        assert_ne!(f.send_to(&left, "session-h-000000", Some(8 << 20)), left.len());
+        let picked = left[f.send_to(&left, "session-h-000000", Some(8 << 20))].url().to_string();
+        assert_ne!(picked, f.workers[fresh].url());
+    }
+
+    #[test]
+    fn stale_tenant_fallback_avoids_a_warming_replica_without_kept_affinity() {
+        let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
+        let home = f.send("session-i-000000", Some(1024));
+        let fresh = f.scale_out();
+        // Warming worker first in the list: 0007's fallback would pick it.
+        let mut list = vec![f.workers[fresh].clone()];
+        list.push(f.workers[1 - home].clone());
+        assert_eq!(f.send_to(&list, "session-i-000000", Some(8 << 20)), 1);
+    }
+
+    #[test]
+    fn matched_tenants_are_ordered_by_recency_then_url() {
+        let f = lj8(on(Lj8Mode::Off, Lj8Mode::Off, Lj8Mode::Off), 1);
+        let tree = f.policy.trees.get("default").unwrap().clone();
+        tree.insert("shared session text", "http://b");
+        tree.insert("shared session text", "http://a");
+        let order: BTreeSet<String> = tree.matched_tenants("shared session text").iter().map(|t| t.to_string()).collect();
+        assert_eq!(order.len(), 2);
+        assert_eq!(tree.matched_tenants("shared session text")[0].as_ref(), "http://a");
     }
 
     #[test]

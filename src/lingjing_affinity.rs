@@ -104,6 +104,16 @@ pub fn register_trees(trees: Trees) {
         .push(trees);
 }
 
+/// lingjing 0008: drop a worker's tenants from every registered tree.
+pub fn remove_tenant(url: &str) {
+    let Some(all) = TREES.get() else { return };
+    for trees in all.lock().unwrap().iter() {
+        for tree in trees.iter() {
+            tree.value().remove_tenant(url);
+        }
+    }
+}
+
 /// Queue one placement for broadcast. Never blocks the routing path; drops when full.
 pub fn publish(model: &str, text: &str, url: &str) {
     if text.is_empty() || text.len() > MAX_SYNC_TEXT_BYTES {
@@ -265,6 +275,7 @@ async fn bootstrap(host: String, port: u16, self_ip: String) {
                 ),
                 Err(e) => warn!("lingjing affinity bootstrap: {}: {}", peer, e),
             }
+            crate::lingjing_warmup::pull_from_peer(&client, &peer).await;
         }
     }
     info!(
@@ -353,7 +364,15 @@ mod tests {
         assert_eq!(&*r.tenant, "http://10.0.0.2:8000");
         assert_eq!(r.matched_char_count, 16);
         assert_eq!(tree.prefix_match_with_counts(&long).matched_char_count, 0);
-        let fresh = trees.get("fresh").expect("tree created for unseen model");
+        // The tree lands in the first registered map, which is another test's when they overlap.
+        let fresh = TREES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|map| map.get("fresh").map(|tree| tree.value().clone()))
+            .expect("tree created for unseen model");
         assert_eq!(
             &*fresh.prefix_match_with_counts("cccccccccccccccc").tenant,
             "http://10.0.0.1:8000"

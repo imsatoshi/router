@@ -516,16 +516,28 @@ async fn list_workers(State(state): State<Arc<AppState>>, headers: http::HeaderM
     Json(serde_json::json!({ "urls": worker_list })).into_response()
 }
 
+/// lingjing patch (0008): `keep_affinity=1` is ignored by 0007 routers (an unknown query field),
+/// so volcano can send it before the router rollout finishes.
+#[derive(Deserialize)]
+struct RemoveWorkerQuery {
+    url: String,
+    keep_affinity: Option<String>,
+}
+
 async fn remove_worker(
     State(state): State<Arc<AppState>>,
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    Query(RemoveWorkerQuery { url, keep_affinity }): Query<RemoveWorkerQuery>,
     headers: http::HeaderMap,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    state.router.remove_worker(&url);
+    if keep_affinity.as_deref() == Some("1") {
+        state.router.remove_worker_keep_affinity(&url);
+    } else {
+        state.router.remove_worker(&url);
+    }
     (
         StatusCode::OK,
         format!("Successfully removed worker: {url}"),
@@ -557,6 +569,23 @@ async fn lingjing_load(State(state): State<Arc<AppState>>, headers: http::Header
     match crate::lingjing_load::state() {
         Some(load) => Json(load.summary(&state.context.worker_registry)).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "lingjing load sampler disabled"})))
+            .into_response(),
+    }
+}
+
+/// lingjing patch (0008): warming workers for a peer router that just started; 404 when off.
+async fn lingjing_warmup(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    match crate::lingjing_warmup::state()
+        .filter(|s| s.cfg.warmup_mode != crate::lingjing_warmup::Mode::Off)
+    {
+        Some(warmup) => Json(warmup.snapshot()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "lingjing warmup disabled"})),
+        )
             .into_response(),
     }
 }
@@ -905,6 +934,7 @@ pub fn build_app_with_wasm_middleware(
         .route("/get_loads", get(get_loads))
         .route("/lingjing/affinity", post(lingjing_affinity).get(lingjing_affinity_snapshot))
         .route("/lingjing/load", get(lingjing_load))
+        .route("/lingjing/warmup", get(lingjing_warmup))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics));
 
     // Worker management routes
@@ -1143,6 +1173,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_context.client.clone(),
         app_context.router_config.api_key.clone(),
     );
+    crate::lingjing_warmup::start_from_env(app_context.worker_registry.clone());
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
