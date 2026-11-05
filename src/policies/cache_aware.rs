@@ -164,8 +164,9 @@ impl CacheAwarePolicy {
             .or_else(|| crate::lingjing_warmup::state())
     }
 
-    /// lingjing 0008: seed a warming worker's credit: max(other workers' text) - its own, so
-    /// its empty tree does not win every tie. `workers` are the registered workers of the model.
+    /// lingjing 0008: seed a warming worker's credit: the mean of the other workers' text minus
+    /// its own, so its empty tree does not win every tie but starts level with an average
+    /// replica. `workers` are the registered workers of the model.
     pub(crate) fn lingjing_seed_credit(&self, url: &str, workers: &[Arc<dyn Worker>]) {
         let (Some(state), Some(first)) = (self.lingjing_warmup(), workers.first()) else {
             return;
@@ -175,13 +176,10 @@ impl CacheAwarePolicy {
             return;
         };
         let held = |worker: &str| tree.tenant_char_count.get(worker).map_or(0, |count| *count);
-        let largest = workers
-            .iter()
-            .filter(|w| w.url() != url)
-            .map(|w| held(w.url()))
-            .max()
-            .unwrap_or(0);
-        state.set_credit(url, largest.saturating_sub(held(url)));
+        let others: Vec<usize> =
+            workers.iter().filter(|w| w.url() != url).map(|w| held(w.url())).collect();
+        let mean = others.iter().sum::<usize>().checked_div(others.len()).unwrap_or(0);
+        state.set_credit(url, mean.saturating_sub(held(url)));
     }
 
     /// The worker a hit should go to: the matched tenant, or with kept affinity another usable
@@ -241,9 +239,23 @@ impl CacheAwarePolicy {
         let match_rate = result.matched_char_count as f32 / result.input_char_count as f32;
         let tenant: &str = &result.tenant;
         match_rate > self.config.cache_threshold
+            && !self.lingjing_is_false_hit(text, &result, crate::lingjing_warmup::Mode::On)
             && workers
                 .iter()
                 .any(|w| w.url() == tenant && w.is_healthy())
+    }
+
+    /// lingjing 0008: does this match clear the threshold only because two session hashes share
+    /// a few leading chars? Answers true only while exact matching is in `mode`.
+    fn lingjing_is_false_hit(
+        &self,
+        text: &str,
+        result: &crate::tree::PrefixMatchResult,
+        mode: crate::lingjing_warmup::Mode,
+    ) -> bool {
+        self.lingjing_warmup().is_some_and(|state| state.cfg.exact_session == mode)
+            && result.matched_char_count < result.input_char_count
+            && crate::lingjing_warmup::is_session_hash(text)
     }
 
     /// lingjing 0006: the `key`-minimal healthy worker, steered off a saturated replica for
@@ -437,8 +449,8 @@ impl CacheAwarePolicy {
     }
 }
 
-impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker_with_headers(
+impl CacheAwarePolicy {
+    fn select_worker_inner(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
@@ -480,6 +492,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             crate::lingjing_warmup::Placement::from_headers(headers, count)
         });
         let mut kept_match = None;
+        let mut would_false_hit = false;
         if is_imbalanced {
             // lingjing 0008: a hit on a usable, unsaturated worker stays. The match is only
             // computed with a feature on: it refreshes tenant timestamps, and off means 0007.
@@ -489,9 +502,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
                 let matched = tree.as_ref().map(|tree| {
                     let result = tree.prefix_match_with_counts(text);
-                    let hit = result.input_char_count > 0
+                    let mut hit = result.input_char_count > 0
                         && result.matched_char_count as f32 / result.input_char_count as f32
                             > self.config.cache_threshold;
+                    if hit && self.lingjing_is_false_hit(text, &result, Mode::On) {
+                        crate::lingjing_warmup::record_session_match("false_hit_avoided");
+                        hit = false;
+                    } else if hit && self.lingjing_is_false_hit(text, &result, Mode::Shadow) {
+                        // Counted in this branch only when the hit path below will not count it.
+                        would_false_hit = true;
+                    }
                     let target = hit
                         .then(|| self.lingjing_hit_target(tree, text, &result.tenant, workers))
                         .flatten();
@@ -519,6 +539,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             }
             if kept_match.is_none() {
+                if would_false_hit {
+                    crate::lingjing_warmup::record_session_match("would_false_hit");
+                }
                 return self.select_worker_min_load(
                     workers,
                     request_text,
@@ -594,10 +617,29 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             })
         };
 
+        // lingjing 0008: a session hash either matches whole or is a new session.
+        let threshold_hit = match_rate > self.config.cache_threshold;
+        let false_hit = threshold_hit
+            && self.lingjing_is_false_hit(text, &result, crate::lingjing_warmup::Mode::On);
+        if warmup.is_some_and(|s| s.cfg.exact_session != crate::lingjing_warmup::Mode::Off)
+            && crate::lingjing_warmup::is_session_hash(text)
+        {
+            crate::lingjing_warmup::record_session_match(if false_hit {
+                "false_hit_avoided"
+            } else if !threshold_hit {
+                "new"
+            } else if result.matched_char_count < result.input_char_count {
+                "would_false_hit"
+            } else {
+                "exact"
+            });
+        }
+        let is_hit = threshold_hit && !false_hit;
+
         // Select worker without String allocation
         let keep_on = warmup
             .is_some_and(|s| s.cfg.keep_affinity == crate::lingjing_warmup::Mode::On);
-        let selected_idx = if match_rate > self.config.cache_threshold {
+        let selected_idx = if is_hit {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
             let target = self.lingjing_hit_target(&tree, text, &result.tenant, workers);
             if target.is_none() && keep_on {
@@ -644,7 +686,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
 
         // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
+        if is_hit {
             let tenant_url: &str = &result.tenant;
             if warmup.is_some_and(|s| s.cfg.keep_affinity == crate::lingjing_warmup::Mode::Shadow) {
                 crate::lingjing_warmup::record_keep_affinity("would_retain", tenant_url);
@@ -669,6 +711,23 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         } else {
             None
         }
+    }
+
+}
+
+impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        let chosen = self.select_worker_inner(workers, request_text, headers);
+        if let (Some(state), Some(idx), Some(text)) = (self.lingjing_warmup(), chosen, request_text) {
+            let body = crate::lingjing_warmup::Placement::from_headers(headers, false).body_bytes;
+            state.observe_route(text, workers[idx].url(), body);
+        }
+        chosen
     }
 
     fn name(&self) -> &'static str {
@@ -1065,6 +1124,78 @@ mod tests {
         out
     }
 
+    /// Session hashes only, drawn from a few leading prefixes so that most new sessions collide
+    /// with an older one past the 0.3 threshold (5 of 16 chars and more), under load swings and a
+    /// scale-out. The 0007 side of the exact-match switch. No worker leaves: survivor choice on
+    /// multi-tenant nodes is random per process in 0007 (see `lingjing_decision_trace`).
+    fn lingjing_hash_trace(
+        policy: &CacheAwarePolicy,
+        load: &crate::lingjing_load::LoadState,
+    ) -> String {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % bound
+        };
+        let pool: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(format!("http://hash-{i}:8000"), WorkerType::Regular))
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        let mut active: Vec<Arc<dyn Worker>> = pool[..2].to_vec();
+        policy.init_workers(&active);
+        let mut out = String::new();
+        let mut sessions: Vec<String> = Vec::new();
+        let mut held: Vec<Arc<dyn Worker>> = Vec::new();
+        for op in 0..1200u32 {
+            if op == 600 {
+                active.push(pool[2].clone());
+                policy.init_workers(&active);
+            }
+            match next(6) {
+                0 => {
+                    let w = active[next(active.len() as u64) as usize].clone();
+                    for _ in 0..=next(12) {
+                        w.increment_load();
+                        held.push(w.clone());
+                    }
+                }
+                1 | 2 => {
+                    for _ in 0..next(10) {
+                        if !held.is_empty() {
+                            held.swap_remove(next(held.len() as u64) as usize).decrement_load();
+                        }
+                    }
+                }
+                3 => load.force(active[next(active.len() as u64) as usize].url(), next(3) == 0),
+                _ => {}
+            }
+            let text = if next(3) == 0 && !sessions.is_empty() {
+                sessions[next(sessions.len() as u64) as usize].clone()
+            } else {
+                let shared = 5 + next(6) as usize;
+                let lead = format!("{:05x}", next(4) * 0x11111);
+                let tail = format!("{:016x}", next(u64::MAX).wrapping_mul(0x2545_f491_4f6c_dd1d));
+                let s = format!("{lead}{}", &tail[..11]);
+                let s = format!("{}{}", &s[..shared.min(16)], &tail[..16 - shared.min(16)]);
+                sessions.push(s.clone());
+                s
+            };
+            let headers: Option<crate::policies::RequestHeaders> =
+                Some([("content-length".to_string(), "1024".to_string())].into());
+            let picked = policy
+                .select_worker_with_headers(&active, Some(&text), headers.as_ref())
+                .map(|idx| active[idx].url().to_string());
+            out.push_str(&format!("{op} {}\n", picked.as_deref().unwrap_or("none")));
+        }
+        let tree = policy.trees.get("default").unwrap().value().clone();
+        let mut sizes: Vec<_> = tree.get_used_size_per_tenant().into_iter().collect();
+        sizes.sort();
+        out.push_str(&format!("tree {sizes:?}\n"));
+        out
+    }
+
     fn trace_policy() -> (CacheAwarePolicy, Arc<crate::lingjing_load::LoadState>) {
         let load = Arc::new(crate::lingjing_load::LoadState::new(crate::lingjing_load::Config {
             avoid_saturated: true,
@@ -1090,10 +1221,44 @@ mod tests {
         assert_eq!(trace.lines().count(), GOLDEN_0007.lines().count());
     }
 
+    const GOLDEN_0007_HASHES: &str =
+        include_str!("../../tests/fixtures/lingjing_0007_hash_decisions.txt");
+
+    fn assert_same_hash_trace_as_0007(trace: String) {
+        for (line, (got, want)) in trace.lines().zip(GOLDEN_0007_HASHES.lines()).enumerate() {
+            assert_eq!(got, want, "first difference from 0007 at line {}", line + 1);
+        }
+        assert_eq!(trace.lines().count(), GOLDEN_0007_HASHES.lines().count());
+    }
+
     #[test]
     fn lingjing_all_off_decides_exactly_like_0007() {
         let (policy, load) = trace_policy();
         assert_same_as_0007(lingjing_decision_trace(&policy, &load, &|_, _| {}));
+    }
+
+    #[test]
+    fn lingjing_all_off_decides_colliding_hashes_exactly_like_0007() {
+        let (policy, load) = trace_policy();
+        assert_same_hash_trace_as_0007(lingjing_hash_trace(&policy, &load));
+    }
+
+    #[test]
+    fn lingjing_all_shadow_decides_colliding_hashes_exactly_like_0007() {
+        use crate::lingjing_warmup::{Config, Mode, State};
+        let state = Arc::new(State::new(Config {
+            warmup_mode: Mode::Shadow,
+            keep_hit: Mode::Shadow,
+            keep_affinity: Mode::Shadow,
+            exact_session: Mode::Shadow,
+            route_quality: Mode::On,
+            ..Config::default()
+        }));
+        let (policy, load) = trace_policy();
+        let policy = policy.with_lingjing_warmup(state);
+        let trace = counted(|| lingjing_hash_trace(&policy, &load));
+        assert!(trace.1.get("vllm_router_lingjing_session_match_total:would_false_hit").copied().unwrap_or(0) > 100, "{:?}", trace.1);
+        assert_same_hash_trace_as_0007(trace.0);
     }
 
     #[test]
@@ -1103,6 +1268,8 @@ mod tests {
             warmup_mode: Mode::Shadow,
             keep_hit: Mode::Shadow,
             keep_affinity: Mode::Shadow,
+            exact_session: Mode::Shadow,
+            route_quality: Mode::On,
             startup_grace_secs: 0,
             ..Config::default()
         }));
@@ -1324,8 +1491,9 @@ mod tests {
     }
 
     #[test]
-    fn slow_start_credit_with_uneven_old_trees_pins_the_design_formula() {
-        // credit = max(others) - own (design §4.1): the smaller old tree fills up first.
+    fn slow_start_credit_is_the_mean_of_the_other_trees() {
+        // credit = mean(others) - own (design §4.1). The largest tree would starve the new replica
+        // until every old one caught up with it; the mean lets it share with the smaller one.
         let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 2);
         let tree = f.policy.trees.get("default").unwrap().clone();
         for i in 0..3000 {
@@ -1334,13 +1502,193 @@ mod tests {
         for i in 0..1000 {
             tree.insert(&sid(12, i), f.workers[1].url());
         }
+        let held = tree.get_used_size_per_tenant();
+        let (large, small) = (held[f.workers[0].url()], held[f.workers[1].url()]);
         let fresh = f.scale_out();
+        assert_eq!(f.state.credit(f.workers[fresh].url()), (large + small) / 2);
         let mut landed = [0usize; 3];
         for i in 0..1500 {
             landed[f.send(&sid(13, i), Some(1024))] += 1;
         }
-        assert_eq!(landed[fresh], 0, "nothing until worker 1 has caught up: {landed:?}");
-        assert!(landed[1] >= 1490, "{landed:?}");
+        assert!(landed[0] <= 15, "only 5-char collisions reach the largest tree: {landed:?}");
+        assert!((1100..=1300).contains(&landed[1]), "the smaller tree catches up first: {landed:?}");
+        assert!((200..=350).contains(&landed[fresh]), "then the two share: {landed:?}");
+    }
+
+    #[test]
+    fn slow_start_new_replica_keeps_its_share_after_the_window() {
+        // A window's worth of small sessions must not push the replica behind for good.
+        let mut f = lj8(
+            Lj8Config { warmup_secs: 10, ..on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off) },
+            2,
+        );
+        seed_sessions(&f, 2000);
+        let fresh = f.scale_out();
+        for i in 0..600 {
+            f.send(&sid(2, i), Some(1024));
+        }
+        f.state.advance(std::time::Duration::from_secs(11));
+        assert!(!f.state.is_warming(f.workers[fresh].url()));
+        let landed = (0..1200).filter(|&i| f.send(&sid(3, i), Some(1024)) == fresh).count();
+        assert!((340..=460).contains(&landed), "about a third after the window: {landed}");
+    }
+
+    // ── 0008: session hashes match whole ──
+
+    fn hex_session(i: u64) -> String {
+        let mut x = i.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        format!("{:016x}", x ^ (x >> 31))
+    }
+
+    /// The share of brand-new sessions that clear the threshold against a tree of `n` hashes.
+    fn false_hit_share(n: u64, threshold: f32) -> (f64, f64) {
+        let tree = Tree::new();
+        let mut cumulative = 0u64;
+        let hit = |tree: &Tree, s: &str| {
+            let r = tree.prefix_match_with_counts(s);
+            r.matched_char_count as f32 / r.input_char_count as f32 > threshold
+        };
+        for i in 0..n {
+            let s = hex_session(i);
+            cumulative += u64::from(hit(&tree, &s));
+            tree.insert(&s, "http://w:8000");
+        }
+        let probes = 100_000u64;
+        let at_n = (0..probes).filter(|i| hit(&tree, &hex_session(n + i))).count();
+        (cumulative as f64 / n as f64, at_n as f64 / probes as f64)
+    }
+
+    #[test]
+    fn false_hits_are_measured_not_estimated() {
+        let (cumulative, at_100k) = false_hit_share(100_000, 0.3);
+        println!("false hits: {cumulative:.4} of the first 100k, {at_100k:.4} at 100k");
+        // 1 - exp(-100000 / 16^5) = 0.0910 for the next session, about half that on average.
+        assert!((0.085..0.097).contains(&at_100k), "{at_100k}");
+        assert!((0.042..0.050).contains(&cumulative), "{cumulative}");
+    }
+
+    const SETTLED: &str = "abcde00000000001";
+    const COLLIDES: &str = "abcde11111111111";
+
+    fn collision_fleet(exact: Lj8Mode) -> Lj8 {
+        let f = lj8(Lj8Config { exact_session: exact, ..Lj8Config::default() }, 2);
+        // Worker 0 holds the older session and more text, so the new-session path picks worker 1.
+        let tree = f.policy.trees.get("default").unwrap().clone();
+        tree.insert(SETTLED, f.workers[0].url());
+        tree.insert("ffff000000000000", f.workers[0].url());
+        f
+    }
+
+    #[test]
+    fn exact_match_decides_where_a_colliding_new_session_goes() {
+        let session_match = |seen: &BTreeMap<String, u64>, result: &str| {
+            seen.get(&format!("vllm_router_lingjing_session_match_total:{result}")).copied().unwrap_or(0)
+        };
+        let f = collision_fleet(Lj8Mode::Off);
+        let (landed, seen) = counted(|| f.send(COLLIDES, Some(1024)));
+        assert_eq!(landed, 0, "0007: five shared chars are a hit");
+        assert_eq!(session_match(&seen, "would_false_hit"), 0);
+
+        let f = collision_fleet(Lj8Mode::Shadow);
+        let (landed, seen) = counted(|| f.send(COLLIDES, Some(1024)));
+        assert_eq!(landed, 0, "shadow routes like off");
+        assert_eq!(session_match(&seen, "would_false_hit"), 1);
+
+        let f = collision_fleet(Lj8Mode::On);
+        let (landed, seen) = counted(|| f.send(COLLIDES, Some(1024)));
+        assert_eq!(landed, 1, "a new session takes the new-session path");
+        assert_eq!(session_match(&seen, "false_hit_avoided"), 1);
+        let (again, seen) = counted(|| f.send(COLLIDES, Some(1024)));
+        assert_eq!(again, 1, "and its next turn matches whole");
+        assert_eq!(session_match(&seen, "exact"), 1);
+        let (unseen, seen) = counted(|| f.send("9999000000000000", Some(1024)));
+        assert_eq!(unseen, 1);
+        assert_eq!(session_match(&seen, "new"), 1, "the denominator for the shadow ratio");
+    }
+
+    #[test]
+    fn exact_match_takes_fifteen_of_sixteen_as_a_new_session_too() {
+        let f = collision_fleet(Lj8Mode::On);
+        assert_eq!(f.send("abcde00000000002", Some(1024)), 1);
+    }
+
+    #[test]
+    fn exact_match_leaves_prefix_texts_on_the_threshold() {
+        let f = lj8(Lj8Config { exact_session: Lj8Mode::On, ..Lj8Config::default() }, 2);
+        let home = f.send("session-a-000000", Some(1024));
+        assert_eq!(f.send("session-a-111111", Some(1024)), home, "16 chars, not a hash");
+        let long = "x".repeat(400);
+        let home = f.send(&long, Some(1024));
+        assert_eq!(f.send(&format!("{long}{}", "y".repeat(300)), Some(1024)), home);
+    }
+
+    #[test]
+    fn exact_match_applies_while_imbalanced_and_to_the_admission_check() {
+        let f = lj8(
+            Lj8Config {
+                exact_session: Lj8Mode::On,
+                keep_hit: Lj8Mode::On,
+                ..Lj8Config::default()
+            },
+            2,
+        );
+        let policy = &f.policy;
+        let tree = policy.trees.get("default").unwrap().clone();
+        tree.insert(SETTLED, f.workers[0].url());
+        assert!(policy.has_cache_hit(&f.workers, SETTLED));
+        assert!(!policy.has_cache_hit(&f.workers, COLLIDES), "a collision is not a known session");
+        for _ in 0..12 {
+            f.workers[0].increment_load();
+        }
+        let headers: crate::policies::RequestHeaders =
+            [("content-length".to_string(), "1024".to_string())].into();
+        let (landed, seen) = counted(|| {
+            policy.select_worker_with_headers(&f.workers, Some(COLLIDES), Some(&headers))
+        });
+        assert_eq!(landed, Some(1), "not kept on worker 0 as a hit");
+        assert_eq!(imbalance_count(&seen, "moved_new"), 1, "{seen:?}");
+        assert_eq!(
+            policy.select_worker_with_headers(&f.workers, Some(SETTLED), Some(&headers)),
+            Some(0),
+            "a whole match still is one"
+        );
+    }
+
+    // ── 0008: route quality ──
+
+    #[test]
+    fn route_quality_counts_turns_that_moved() {
+        let f = lj8(Lj8Config { route_quality: Lj8Mode::On, ..Lj8Config::default() }, 2);
+        let quality = |seen: &BTreeMap<String, u64>, name: &str, result: &str| {
+            seen.get(&format!("vllm_router_lingjing_route_quality{name}_total:{result}"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let s = "0123456789abcdef";
+        let (home, seen) = counted(|| f.send(s, Some(1000)));
+        assert_eq!((quality(&seen, "", "first"), quality(&seen, "_bytes", "first")), (1, 1000));
+        let (_, seen) = counted(|| f.send(s, Some(1400)));
+        assert_eq!((quality(&seen, "", "same"), quality(&seen, "_bytes", "same")), (1, 400), "the new bytes");
+        let (_, seen) = counted(|| f.send(s, Some(900)));
+        assert_eq!(quality(&seen, "_bytes", "same"), 0, "a shorter body adds nothing");
+        // An imbalanced fleet moves the hit: the whole body is cold on the other worker.
+        f.load(home, 20);
+        let (moved, seen) = counted(|| f.send(s, Some(5000)));
+        assert_ne!(moved, home);
+        assert_eq!((quality(&seen, "", "moved"), quality(&seen, "_bytes", "moved")), (1, 5000));
+    }
+
+    #[test]
+    fn route_quality_ignores_prefix_texts_and_stays_quiet_when_off() {
+        let f = lj8(Lj8Config { route_quality: Lj8Mode::On, ..Lj8Config::default() }, 2);
+        let quiet = |seen: BTreeMap<String, u64>| !seen.keys().any(|k| k.contains("route_quality"));
+        let (_, seen) = counted(|| f.send(&"x".repeat(100), Some(1000)));
+        assert!(quiet(seen));
+        let f = lj8(Lj8Config::default(), 2);
+        let (_, seen) = counted(|| f.send("0123456789abcdef", Some(1000)));
+        assert!(quiet(seen));
     }
 
     #[test]

@@ -191,6 +191,8 @@ async fn slow_start_and_kept_affinity_over_real_http() {
         ("LINGJING_WARMUP_MODE", "on"),
         ("LINGJING_KEEP_HIT_ON_IMBALANCE", "1"),
         ("LINGJING_EVICT_KEEP_AFFINITY", "1"),
+        ("LINGJING_SESSION_EXACT_MATCH", "1"),
+        ("LINGJING_ROUTE_QUALITY", "1"),
         ("LINGJING_WARMUP_STARTUP_GRACE_SECS", "0"),
     ] {
         std::env::set_var(name, value);
@@ -265,6 +267,24 @@ async fn slow_start_and_kept_affinity_over_real_http() {
     let small_on_c = seen_c.lock().unwrap().len();
     assert!(small_on_c > 0, "the new replica must take small sessions");
     assert!(small_on_c < 300, "and not all of them");
+
+    // Two hashes sharing their first chars are two sessions: each one is placed on its own, and
+    // both come back to where they went.
+    let (one, two) = ("c0ffee0000000001", "c0ffee1111111111");
+    f.send(one, 64).await;
+    f.send(two, 64).await;
+    let (on_a, on_b) = (holds(&seen_a, one), holds(&seen_b, one));
+    f.send(one, 64).await;
+    assert_eq!((holds(&seen_a, one), holds(&seen_b, one)), (on_a, on_b));
+    let count = |seen: &Seen, s: &str| seen.lock().unwrap().iter().filter(|x| *x == s).count();
+    let served_two = [&seen_a, &seen_b, &seen_c].map(|seen| count(seen, two));
+    f.send(two, 64).await;
+    let again_two = [&seen_a, &seen_b, &seen_c].map(|seen| count(seen, two));
+    assert_eq!(
+        served_two.iter().position(|n| *n == 1),
+        again_two.iter().position(|n| *n == 2),
+        "a whole match stays put"
+    );
 
     // Health eviction keeps the affinity; a session waits elsewhere and comes back.
     let s = session(1, (0..40).find(|&i| holds(&seen_a, &session(1, i))).unwrap());

@@ -18,18 +18,39 @@
 //!    path, and never deletes the tenant. Leftovers are dropped after
 //!    `LINGJING_KEEP_AFFINITY_TTL_SECS` (600) unless the worker is registered again.
 //!
+//! 4. Session hashes match whole (`LINGJING_SESSION_EXACT_MATCH=0|shadow|1`). A session hash has
+//!    no prefix structure: two sessions sharing five of sixteen hex chars clear the 0.3 threshold
+//!    by accident, and a brand-new session takes the hit path. With the feature on a 16-hex text
+//!    must match in full; prefix texts keep the threshold. `shadow` counts `would_false_hit`.
+//! 5. Route quality (`LINGJING_ROUTE_QUALITY=0|1`), measurement only. Remembers each session's
+//!    last worker and counts turns that stayed or moved, in requests and body bytes. A moved
+//!    turn is logged with the first 8 chars of the hash, the same string the gateway logs as
+//!    `session`, so it joins `sched_decision` and then `usage_logs` for the real token counts.
+//!    The router does not read `usage`.
+//!
 //! `shadow` records the decision (metrics, one log line) and routes as `off`. Logs carry the
-//! worker URL, the result and the body size, never request content or routing text.
+//! worker URL, the result and the body size, never request content, and at most the 8-char
+//! session prefix the gateway already logs.
 
 use crate::core::{Worker, WorkerRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const PURGE_INTERVAL: Duration = Duration::from_secs(5);
+/// Sessions remembered for route quality, oldest first out. ty starts about 8000 a day.
+const SESSION_MEMO_CAPACITY: usize = 100_000;
+/// The gateway's `shortSessionHash`: what its logs call `session`.
+const LOGGED_SESSION_CHARS: usize = 8;
+
+/// The gateway's session hash: xxhash as 16 lowercase hex chars. Client-chosen session ids and
+/// prefix texts are not this shape and keep the threshold.
+pub fn is_session_hash(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -62,6 +83,8 @@ pub struct Config {
     pub keep_hit: Mode,
     pub keep_affinity: Mode,
     pub keep_affinity_ttl_secs: u64,
+    pub exact_session: Mode,
+    pub route_quality: Mode,
 }
 
 impl Default for Config {
@@ -74,6 +97,8 @@ impl Default for Config {
             keep_hit: Mode::Off,
             keep_affinity: Mode::Off,
             keep_affinity_ttl_secs: 600,
+            exact_session: Mode::Off,
+            route_quality: Mode::Off,
         }
     }
 }
@@ -103,6 +128,8 @@ impl Config {
                 "LINGJING_KEEP_AFFINITY_TTL_SECS",
                 defaults.keep_affinity_ttl_secs,
             ),
+            exact_session: mode("LINGJING_SESSION_EXACT_MATCH"),
+            route_quality: mode("LINGJING_ROUTE_QUALITY"),
         }
     }
 
@@ -114,6 +141,8 @@ impl Config {
         self.warmup_mode != Mode::Off
             || self.keep_hit != Mode::Off
             || self.keep_affinity != Mode::Off
+            || self.exact_session != Mode::Off
+            || self.route_quality != Mode::Off
     }
 }
 
@@ -147,6 +176,35 @@ struct Warm {
     credit: usize,
 }
 
+/// One session's previous turn.
+#[derive(Debug, Clone)]
+pub struct LastTurn {
+    pub worker: String,
+    pub body_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct SessionMemo {
+    latest: HashMap<String, LastTurn>,
+    order: VecDeque<String>,
+}
+
+impl SessionMemo {
+    /// Remember this turn; the previous one comes back.
+    fn replace(&mut self, session: &str, turn: LastTurn) -> Option<LastTurn> {
+        let previous = self.latest.insert(session.to_string(), turn);
+        if previous.is_none() {
+            self.order.push_back(session.to_string());
+            while self.order.len() > SESSION_MEMO_CAPACITY {
+                if let Some(old) = self.order.pop_front() {
+                    self.latest.remove(&old);
+                }
+            }
+        }
+        previous
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     warm: HashMap<String, Warm>,
@@ -178,6 +236,7 @@ pub struct State {
     /// Selection takes no lock until the first scale-out.
     has_warm: AtomicBool,
     inner: RwLock<Inner>,
+    sessions: Mutex<SessionMemo>,
 }
 
 fn decision(kind: &'static str, result: &'static str, worker: &str, body_bytes: Option<u64>) {
@@ -200,6 +259,10 @@ pub fn record_imbalance(action: &'static str, worker: &str) {
     decision("imbalance", action, worker, None);
 }
 
+pub fn record_session_match(result: &'static str) {
+    metrics::counter!("vllm_router_lingjing_session_match_total", "result" => result).increment(1);
+}
+
 pub fn record_keep_affinity(action: &'static str, worker: &str) {
     metrics::counter!("vllm_router_lingjing_keep_affinity_total", "action" => action).increment(1);
     decision("keep_affinity", action, worker, None);
@@ -213,6 +276,7 @@ impl State {
             skew_ms: AtomicU64::new(0),
             has_warm: AtomicBool::new(false),
             inner: RwLock::new(Inner::default()),
+            sessions: Mutex::new(SessionMemo::default()),
         }
     }
 
@@ -226,6 +290,39 @@ impl State {
 
     fn now(&self) -> Instant {
         Instant::now() + Duration::from_millis(self.skew_ms.load(Ordering::Relaxed))
+    }
+
+    /// Route quality: compare this turn with the session's previous one. Only session hashes:
+    /// a prefix text changes every turn, so it has no identity to follow.
+    pub fn observe_route(&self, text: &str, worker: &str, body_bytes: Option<u64>) {
+        if self.cfg.route_quality == Mode::Off || !is_session_hash(text) {
+            return;
+        }
+        let turn = LastTurn { worker: worker.to_string(), body_bytes };
+        let previous = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(text, turn);
+        let this_turn = body_bytes.unwrap_or(0);
+        let (result, bytes) = match &previous {
+            None => ("first", this_turn),
+            Some(last) if last.worker != worker => ("moved", this_turn),
+            Some(last) => ("same", this_turn.saturating_sub(last.body_bytes.unwrap_or(0))),
+        };
+        metrics::counter!("vllm_router_lingjing_route_quality_total", "result" => result).increment(1);
+        metrics::counter!("vllm_router_lingjing_route_quality_bytes_total", "result" => result)
+            .increment(bytes);
+        if let Some(last) = previous.filter(|last| last.worker != worker) {
+            info!(
+                kind = "route_quality",
+                result = "moved",
+                session = &text[..LOGGED_SESSION_CHARS],
+                from = last.worker.as_str(),
+                to = worker,
+                body_bytes = body_bytes.map(|n| n as i64).unwrap_or(-1),
+            );
+        }
     }
 
     /// Move this state's clock forward (tests).
@@ -544,6 +641,40 @@ mod tests {
         });
         assert_eq!(cfg.warmup_mode, Mode::Shadow);
         assert_eq!((cfg.warmup_secs, cfg.max_body_bytes), (3600, 1024));
+    }
+
+    #[test]
+    fn lingjing_session_hash_shape_is_exact() {
+        assert!(is_session_hash("0123456789abcdef"));
+        for other in ["0123456789abcde", "0123456789abcdef0", "0123456789ABCDEF", "session-a-000000", ""] {
+            assert!(!is_session_hash(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn lingjing_exact_match_and_route_quality_are_read_from_env_and_count_as_enabled() {
+        let cfg = Config::from_lookup(|name| match name {
+            "LINGJING_SESSION_EXACT_MATCH" => Some("shadow".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.exact_session, Mode::Shadow);
+        assert!(cfg.any_enabled());
+        let cfg = Config::from_lookup(|name| (name == "LINGJING_ROUTE_QUALITY").then(|| "1".into()));
+        assert_eq!(cfg.route_quality, Mode::On);
+        assert!(cfg.any_enabled());
+    }
+
+    #[test]
+    fn lingjing_session_memo_forgets_the_oldest_past_capacity() {
+        let mut memo = SessionMemo::default();
+        let turn = || LastTurn { worker: "w".into(), body_bytes: None };
+        for i in 0..SESSION_MEMO_CAPACITY + 1 {
+            assert!(memo.replace(&i.to_string(), turn()).is_none());
+        }
+        assert_eq!(memo.latest.len(), SESSION_MEMO_CAPACITY);
+        assert!(!memo.latest.contains_key("0"));
+        assert!(memo.replace("1", turn()).is_some(), "a repeat is not a new entry");
+        assert_eq!(memo.order.len(), SESSION_MEMO_CAPACITY);
     }
 
     #[test]
