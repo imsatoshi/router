@@ -1806,6 +1806,20 @@ mod tests {
     }
 
     #[test]
+    fn lingjing_uncached_shadow_decides_the_full_trace_like_0007() {
+        let warmup = Arc::new(Lj8State::new(Lj8Config {
+            track_sessions: true,
+            startup_grace_secs: 0,
+            ..Lj8Config::default()
+        }));
+        let (policy, load) = trace_policy();
+        let policy = policy
+            .with_lingjing_warmup(warmup)
+            .with_lingjing_uncached(Arc::new(Lj9State::new(lj9_cfg(Lj8Mode::Shadow))));
+        assert_same_as_0007(lingjing_decision_trace(&policy, &load, &|_, _| {}));
+    }
+
+    #[test]
     fn lingjing_uncached_shadow_decides_like_0007() {
         let warmup = Arc::new(Lj8State::new(Lj8Config {
             track_sessions: true,
