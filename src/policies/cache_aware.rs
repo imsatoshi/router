@@ -1797,6 +1797,25 @@ mod tests {
     }
 
     #[test]
+    fn uncached_time_gate_releases_the_size_gate_for_a_warming_replica() {
+        for (mode, busy_tokens, reaches_fresh) in [
+            (Lj8Mode::On, 4_999, false),
+            (Lj8Mode::On, 5_000, true),
+            (Lj8Mode::Shadow, 5_000, false),
+        ] {
+            let mut f = lj8(on(Lj8Mode::On, Lj8Mode::Off, Lj8Mode::Off), 1);
+            seed_sessions(&f, 200);
+            let fresh = f.scale_out();
+            let uncached = Arc::new(Lj9State::new(lj9_cfg(mode)));
+            f.policy = std::mem::replace(&mut f.policy, CacheAwarePolicy::new())
+                .with_lingjing_uncached(uncached.clone());
+            let _busy = uncached.charge(f.workers[1 - fresh].url(), busy_tokens);
+            let landed = f.send("7777000000000000", Some(4 << 20));
+            assert_eq!(landed == fresh, reaches_fresh, "{mode:?} {busy_tokens}");
+        }
+    }
+
+    #[test]
     fn uncached_shadow_counts_the_move_and_stays() {
         let (policy, workers, uncached, home) = lj9(Lj8Mode::Shadow);
         let _busy = uncached.charge(workers[home].url(), 10_000);
