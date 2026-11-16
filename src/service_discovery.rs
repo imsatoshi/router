@@ -67,7 +67,13 @@ pub struct PodInfo {
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
     pub bootstrap_port: Option<u16>,
+    /// lingjing 0011: per-pod HTTP port from the `vllm.ai/http-port` annotation; overrides
+    /// `--service-discovery-port` so prefill and decode pods may listen on different ports.
+    pub http_port: Option<u16>,
 }
+
+/// lingjing 0011: pod annotation carrying this worker's HTTP port.
+pub const HTTP_PORT_ANNOTATION: &str = "vllm.ai/http-port";
 
 impl PodInfo {
     /// Check if a pod matches any of the given selectors
@@ -153,6 +159,14 @@ impl PodInfo {
             None
         };
 
+        let http_port = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(HTTP_PORT_ANNOTATION))
+            .and_then(|port_str| port_str.parse::<u16>().ok())
+            .filter(|port| *port != 0);
+
         Some(PodInfo {
             name,
             ip: pod_ip,
@@ -160,6 +174,7 @@ impl PodInfo {
             is_ready,
             pod_type,
             bootstrap_port,
+            http_port,
         })
     }
 
@@ -169,8 +184,9 @@ impl PodInfo {
     }
 
     /// Generates a worker URL for this pod.
+    /// The pod's `vllm.ai/http-port` annotation wins over the discovery-wide port.
     pub fn worker_url(&self, port: u16) -> String {
-        format!("http://{}", SocketAddr::new(self.ip, port))
+        format!("http://{}", SocketAddr::new(self.ip, self.http_port.unwrap_or(port)))
     }
 }
 
@@ -610,6 +626,47 @@ mod tests {
     }
 
     // Helper to create a PD config for testing
+    #[test]
+    fn lingjing_http_port_annotation_overrides_discovery_port() {
+        let config = create_pd_config();
+        let mut prefill = create_pd_k8s_pod("p0", "10.20.10.3", "prefill", None);
+        prefill
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(HTTP_PORT_ANNOTATION.to_string(), "7200".to_string());
+        let mut decode = create_pd_k8s_pod("d0", "10.20.10.52", "decode", None);
+        decode
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(HTTP_PORT_ANNOTATION.to_string(), "7100".to_string());
+        let plain = create_pd_k8s_pod("d1", "10.20.10.53", "decode", None);
+        let mut invalid = create_pd_k8s_pod("d2", "10.20.10.54", "decode", None);
+        for bad in ["0", "abc", "70000"] {
+            invalid
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap()
+                .insert(HTTP_PORT_ANNOTATION.to_string(), bad.to_string());
+            let info = PodInfo::from_pod(&invalid, Some(&config)).unwrap();
+            assert_eq!(info.http_port, None, "annotation {bad:?} must be ignored");
+            assert_eq!(info.worker_url(8000), "http://10.20.10.54:8000");
+        }
+
+        let p = PodInfo::from_pod(&prefill, Some(&config)).unwrap();
+        let d = PodInfo::from_pod(&decode, Some(&config)).unwrap();
+        let q = PodInfo::from_pod(&plain, Some(&config)).unwrap();
+        assert_eq!(p.pod_type, Some(PodType::Prefill));
+        assert_eq!(d.pod_type, Some(PodType::Decode));
+        assert_eq!(p.worker_url(8000), "http://10.20.10.3:7200");
+        assert_eq!(d.worker_url(8000), "http://10.20.10.52:7100");
+        assert_eq!(q.worker_url(8000), "http://10.20.10.53:8000");
+    }
+
     fn create_pd_config() -> ServiceDiscoveryConfig {
         let mut prefill_selector = HashMap::new();
         prefill_selector.insert("app".to_string(), "vllm".to_string());
@@ -837,6 +894,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -847,6 +905,7 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -857,6 +916,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -870,6 +930,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
@@ -883,6 +944,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         assert_eq!(
             pod_info.worker_url(8000),
@@ -899,6 +961,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
         };
 
         let pod2 = PodInfo {
@@ -908,6 +971,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
         };
 
         let pod3 = PodInfo {
@@ -917,6 +981,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
         };
 
         assert_eq!(pod1, pod2);
@@ -934,6 +999,7 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -963,6 +1029,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -990,6 +1057,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -1019,6 +1087,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -1046,6 +1115,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
         };
 
         // Add pod to tracked set first
@@ -1080,6 +1150,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -1109,6 +1180,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Regular),
             bootstrap_port: None,
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -1137,6 +1209,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
         };
         let port = 8080u16;
 
@@ -1165,6 +1238,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
         };
 
         // Add pod to tracked set first
