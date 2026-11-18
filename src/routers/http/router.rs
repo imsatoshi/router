@@ -73,14 +73,14 @@ fn emit_http_first_sse<E>(
 /// along with the request (route_typed_request -> send_typed_request -> body / forwarder),
 /// so a client that disconnects at any await point (handler future dropped), an error path,
 /// a retry or a panic all release it, and no path can release it twice.
-struct LoadReservation {
+pub(super) struct LoadReservation {
     worker: Option<Arc<dyn Worker>>,
     /// lingjing 0009: this request's uncached tokens, released at its first chunk.
     uncached: Option<crate::lingjing_uncached::Reservation>,
 }
 
 impl LoadReservation {
-    fn acquire(worker: Arc<dyn Worker>) -> Self {
+    pub(super) fn acquire(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
         RouterMetrics::set_running_requests(worker.url(), worker.load());
         Self {
@@ -89,7 +89,7 @@ impl LoadReservation {
         }
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         self.uncached = None;
         if let Some(worker) = self.worker.take() {
             worker.decrement_load();
@@ -103,7 +103,7 @@ impl LoadReservation {
     }
 
     /// Hand the reservation to a response body (hold_load_until_body_done takes over the decrement).
-    fn into_worker(mut self) -> Option<Arc<dyn Worker>> {
+    pub(super) fn into_worker(mut self) -> Option<Arc<dyn Worker>> {
         self.worker.take()
     }
 }
@@ -139,6 +139,8 @@ impl futures_util::Stream for LoadTrackedBody {
         if matches!(item, Poll::Ready(None)) {
             self.release();
             self.producer_abort.take();
+        } else if matches!(item, Poll::Ready(Some(Err(_)))) {
+            self.release();
         }
         item
     }
@@ -153,7 +155,10 @@ impl Drop for LoadTrackedBody {
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+pub(super) fn hold_load_until_body_done(
+    mut response: Response,
+    worker: Arc<dyn Worker>,
+) -> Response {
     let producer = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>()

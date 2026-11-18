@@ -441,9 +441,11 @@ impl WorkerRegistry {
 /// path), so an unconditional reset would erase the counts of requests still in
 /// flight — a generation spanning the reset would later release against a
 /// newer request's count and make a busy worker look idle. Paths that still
-/// pair increments by hand (transparent proxy, PD) can drift, so keep the reset
+/// pair increments by hand (transparent proxy) can drift, so keep the reset
 /// but, like the legacy checker in worker.rs, only when every worker is nearly
-/// idle. Returns whether the reset happened.
+/// idle. PD reservations are authoritative even at load 1 or 2 and must never
+/// be reset. Both health-checker entry points use this exemption.
+/// Returns whether the regular-worker reset was allowed.
 pub(crate) fn reset_drifted_loads(workers: &[Arc<dyn crate::core::Worker>]) -> bool {
     let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
     if max_load > 2 {
@@ -451,7 +453,10 @@ pub(crate) fn reset_drifted_loads(workers: &[Arc<dyn crate::core::Worker>]) -> b
         return false;
     }
     tracing::debug!("Resetting worker loads (max_load: {})", max_load);
-    for worker in workers {
+    for worker in workers
+        .iter()
+        .filter(|w| matches!(w.worker_type(), WorkerType::Regular))
+    {
         worker.reset_load();
         crate::metrics::RouterMetrics::set_running_requests(worker.url(), 0);
     }

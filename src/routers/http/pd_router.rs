@@ -521,13 +521,6 @@ impl PdRouterBase {
             }
         }
 
-        // Get all workers from registry for load monitoring
-        let all_workers = ctx.worker_registry.get_all();
-        let all_urls: Vec<String> = all_workers
-            .iter()
-            .map(|worker| worker.url().to_string())
-            .collect();
-
         // Initialize cache-aware policies with workers from registry
         // Note: We need to get workers by type and convert to Box<dyn Worker> for CacheAwarePolicy
         // This is a temporary workaround until CacheAwarePolicy is updated to work with Arc<dyn Worker>
@@ -543,7 +536,7 @@ impl PdRouterBase {
 
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
-                let monitor_urls = all_urls.clone();
+                let monitor_registry = ctx.worker_registry.clone();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
@@ -551,7 +544,7 @@ impl PdRouterBase {
 
                 Some(Arc::new(tokio::spawn(async move {
                     Self::monitor_worker_loads_with_client(
-                        monitor_urls,
+                        monitor_registry,
                         tx,
                         monitor_interval,
                         monitor_client,
@@ -677,9 +670,39 @@ impl PdRouterBase {
         Ok(available_workers[selected_idx].clone())
     }
 
+    // /get_load is a server aggregate, not a rank-specific sample. Rank workers
+    // deliberately fall back to their local reservations. Snapshot the registry
+    // every round so additions/removals and discovery never retain stale keys.
+    pub(super) async fn sample_worker_loads(
+        registry: &WorkerRegistry,
+        client: &Client,
+    ) -> HashMap<String, isize> {
+        let futures = registry
+            .get_all()
+            .into_iter()
+            .filter(|worker| {
+                worker.dp_rank().is_none()
+                    && dp_utils::parse_worker_url(worker.url()).1.is_none()
+                    && matches!(
+                        worker.worker_type(),
+                        WorkerType::Prefill { .. } | WorkerType::Decode
+                    )
+            })
+            .map(|worker| async move {
+                get_worker_load(client, worker.base_url())
+                    .await
+                    .map(|load| (worker.url().to_owned(), load))
+            });
+        futures_util::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     // Background task to monitor worker loads with shared client
-    async fn monitor_worker_loads_with_client(
-        worker_urls: Vec<String>,
+    pub(super) async fn monitor_worker_loads_with_client(
+        worker_registry: Arc<WorkerRegistry>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
@@ -687,25 +710,7 @@ impl PdRouterBase {
         decode_policy: Arc<dyn LoadBalancingPolicy>,
     ) {
         loop {
-            let mut loads = HashMap::new();
-
-            let futures: Vec<_> = worker_urls
-                .iter()
-                .map(|url| {
-                    let client = client.clone();
-                    let url = url.clone();
-                    async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
-                        (url, load)
-                    }
-                })
-                .collect();
-
-            let results = futures_util::future::join_all(futures).await;
-
-            for (url, load) in results {
-                loads.insert(url, load);
-            }
+            let loads = Self::sample_worker_loads(&worker_registry, &client).await;
 
             debug!("Worker loads updated: {:?}", loads);
 
@@ -733,7 +738,8 @@ async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
                 Ok(data) => data
                     .get("load")
                     .and_then(|v| v.as_i64())
-                    .map(|v| v as isize),
+                    .filter(|v| *v >= 0)
+                    .and_then(|v| isize::try_from(v).ok()),
                 Err(e) => {
                     debug!("Failed to parse load response from {}: {}", worker_url, e);
                     None
